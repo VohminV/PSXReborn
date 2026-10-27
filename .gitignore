@@ -1,0 +1,176 @@
+# ==========================================
+# PSXReborn — Git Ignore
+# ==========================================
+
+# Build directories
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/dist/
+/release/
+/debug/
+/Debug/
+/Release/
+/x64/
+/Win32/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+*.cmake.user
+!CMakeLists.txt
+
+# Compiled binaries and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.app
+*.pdb
+*.ilk
+*.exp
+*.pch
+*.gch
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Generated code and intermediate artifacts
+*.generated.cpp
+*.generated.h
+*.gen.cpp
+*.gen.h
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*~
+
+# Test output and coverage
+/coverage/
+/test-results/
+/Testing/
+*.gcov
+lcov.info
+junit.xml
+
+# Vulkan / GPU diagnostics
+*.spv
+*.pipeline-cache
+vulkan_cache/
+shader_cache/
+gpu_cache/
+*.crash
+
+# Runtime logs and dumps
+*.log
+logs/
+crash_dumps/
+*.dmp
+core
+core.*
+
+# Emulator and game runtime data
+/saves/
+/savegames/
+/memcards/
+/memory-cards/
+/screenshots/
+/captures/
+/userdata/
+/user-data/
+
+# Proprietary game data — never commit game images or BIOS files
+*.iso
+*.bin
+*.cue
+*.chd
+*.pbp
+*.img
+*.mdf
+*.mds
+*.ccd
+*.sub
+*.bios
+SCPH*.BIN
+scph*.bin
+
+# Note: Remove or narrow the game-data rules if the project
+# intentionally adds legally distributable test fixtures.
+# Prefer small homebrew test assets in a dedicated test directory.
+
+# IDEs and editors
+.idea/
+.vscode/
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+*.code-workspace
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+.history/
+
+# OpenCode and AI-generated temporary files
+.opencode/
+.opencode-cache/
+.ai-cache/
+.ai-work/
+.claude/
+.cursor/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.directory
+.Trash-*
+.Trashes
+
+# Package managers and dependency caches
+/.cache/
+/.cache/
+node_modules/
+vendor/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# Local configuration
+config.local.*
+settings.local.*
+local.properties
+
+# Preserve project documentation and instructions
+!README.md
+!AGENTS.md
+!/docs/

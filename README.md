@@ -8,6 +8,11 @@ The long-term goal is to build a reusable toolchain capable of translating PS1 g
 
 > **Project status: Early development.** The architecture, compatibility layer, and toolchain are under development. Game compatibility and performance targets have not yet been established.
 
+The current milestone implements a PS-X EXE loader, guest memory model, integer
+R3000A interpreter, and inspection/execution CLI. It does not boot a BIOS, run a
+disc, or execute commercial games yet. See [docs/architecture.md](docs/architecture.md)
+for the implemented scope and known limitations.
+
 ## Goals
 
 - **Native code translation** — translate MIPS R3000A instructions into native x86-64 code.
@@ -35,6 +40,23 @@ The project is intended to separate guest hardware behavior from host-specific i
 | Camera Profiles | Configure game-specific mouse-to-camera or mouse-to-analog-stick mappings |
 
 The Vulkan renderer is not intended to replace the entire console architecture. CPU execution, memory behavior, synchronization, audio, and game-specific logic require separate implementations.
+
+## Build and Test
+
+Requirements: CMake 3.20 or newer, a C++20 compiler, and Ninja.
+
+```sh
+cmake -S . -B build -G Ninja -DPSXREBORN_BUILD_TESTS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Inspect or execute a self-contained PS-X EXE:
+
+```sh
+./build/psxreborn inspect path/to/program.exe
+./build/psxreborn run path/to/program.exe --max-steps 1000000
+```
 
 ## Graphics
 
@@ -82,11 +104,11 @@ Camera control is game-dependent. Games without native camera control or suitabl
 
 ## Development Roadmap
 
-- [ ] Repository structure and build system.
-- [ ] Architecture and compatibility documentation.
-- [ ] PS-X EXE parser and executable inspection tools.
-- [ ] Guest memory model and MIPS instruction decoder.
-- [ ] Instruction-level tests and reference comparisons.
+- [x] Repository structure and build system.
+- [x] Architecture and compatibility documentation.
+- [x] PS-X EXE parser and executable inspection tools.
+- [x] Guest memory model and MIPS instruction decoder.
+- [x] Instruction-level tests and reference comparisons.
 - [ ] Initial native code translation pipeline.
 - [ ] Minimal Vulkan rendering prototype.
 - [ ] PS1 GPU command processing and VRAM model.
