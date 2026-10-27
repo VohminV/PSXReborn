@@ -149,14 +149,18 @@ int main(int argc, char** argv) {
     Bios& bios = *biosPtr;
 
     // SDL init
+    SDL_EventState(SDL_QUIT, SDL_IGNORE);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
         std::cerr << "SDL init failed: " << SDL_GetError() << "\n";
         return 1;
     }
     SDL_Window* window = SDL_CreateWindow("PSXReborn", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                           640, 480, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!window) { std::cerr << "window fail: " << SDL_GetError() << "\n"; return 1; }
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer) { std::cerr << "renderer fail: " << SDL_GetError() << "\n"; return 1; }
     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, 1024, 512);
+    if (!texture) { std::cerr << "texture fail: " << SDL_GetError() << "\n"; return 1; }
 
     SDL_GameController* controller = nullptr;
     if (SDL_NumJoysticks() > 0) {
@@ -173,6 +177,7 @@ int main(int argc, char** argv) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) {
+                std::cerr << "SDL_QUIT received\n";
                 running = false;
             } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
                 bool pressed = (e.type == SDL_KEYDOWN);
@@ -191,6 +196,7 @@ int main(int argc, char** argv) {
                     case SDLK_w: setButton(kBtnL2, pressed); break;
                     case SDLK_e: setButton(kBtnR1, pressed); break;
                     case SDLK_r: setButton(kBtnR2, pressed); break;
+                    case SDLK_ESCAPE: running = false; break;
                     default: break;
                 }
             } else if (e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERBUTTONUP) {
@@ -217,10 +223,10 @@ int main(int argc, char** argv) {
         bios.setPadButtons(g_pad);
 
         // Run CPU
-        CpuRunResult result = cpu.run(50000);
+        CpuRunResult result = cpu.run(100000);
         if (result.reason != CpuStopReason::StepLimit && result.reason != CpuStopReason::Syscall &&
             result.reason != CpuStopReason::Breakpoint) {
-            std::cerr << "CPU stop: " << toString(result.reason) << "\n";
+            std::cerr << "CPU stop: " << toString(result.reason) << " pc=" << result.pc << "\n";
             running = false;
         }
 
