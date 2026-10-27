@@ -100,6 +100,9 @@ private:
     uint8_t indexStatus() const;
     void executeCommand(uint8_t command);
     void pushResponse(uint8_t interrupt, std::initializer_list<uint8_t> data);
+    void pushResponse(uint8_t interrupt, const uint8_t* data, size_t size);
+    void scheduleSecondResponse(uint8_t interrupt, uint32_t cycles,
+                                std::initializer_list<uint8_t> data);
     void updateInterrupt();
     void prepareSector();
     void setError(uint8_t code);
@@ -121,6 +124,10 @@ private:
     std::array<uint8_t, 16> parameter_{};
     uint32_t parameterCount_ = 0;
     std::deque<uint8_t> response_;
+    uint32_t secondResponseCycles_ = 0;
+    uint8_t secondResponseInterrupt_ = 0;
+    std::array<uint8_t, 8> secondResponseData_{};
+    uint32_t secondResponseSize_ = 0;
     std::array<uint8_t, 2352> sector_{};
     uint32_t sectorPosition_ = 0;
     uint32_t sectorLength_ = 0;

@@ -110,6 +110,9 @@ public:
     Cdrom& cdrom() { return cdrom_; }
     const Cdrom& cdrom() const { return cdrom_; }
     void setVBlankHandler(std::function<void()> handler) { vblankHandler_ = std::move(handler); }
+    void setIrqHandler(std::function<void()> handler) { irqHandler_ = std::move(handler); }
+    void setPadButtons(uint16_t buttons) { padButtons_ = buttons; }
+    uint16_t padButtons() const { return padButtons_; }
 
 private:
     static constexpr uint32_t kMiscBase = 0x1F801000u;
@@ -128,8 +131,13 @@ private:
     Cdrom cdrom_;
     std::array<uint8_t, kMiscSize> misc_{};
     std::function<void()> vblankHandler_;
+    std::function<void()> irqHandler_;
     uint32_t vblankCycles_ = 0;
     uint32_t hblankCycles_ = 0;
+    uint8_t sioState_ = 0;
+    uint16_t padButtons_ = 0xFFFFu;
+    uint8_t sioReadIndex_ = 0;
+    uint16_t sioButtons_ = 0xFFFFu;
 };
 
 }  // namespace psxreborn

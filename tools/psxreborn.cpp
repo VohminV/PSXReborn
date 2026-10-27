@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -238,7 +239,53 @@ int bootImage(const std::string& path, uint64_t maxSteps) {
     }
     cpu.resetFromExe(image.header.entryPoint, image.header.globalPointer, stackBase, stackOffset);
 
-    const CpuRunResult result = cpu.run(maxSteps);
+    cpu.setCycleCallback([&](uint32_t cycles){
+        system.tick(cycles);
+    });
+    CpuRunResult result{};
+    uint64_t executedSteps = 0;
+    const char* pcLog = std::getenv("PSXREBORN_PC_LOG");
+    do {
+        const uint64_t budget = std::min<uint64_t>(maxSteps - executedSteps, 100000u);
+        result = cpu.run(budget);
+        executedSteps += result.steps;
+        if (pcLog != nullptr) {
+            std::cerr << "pc@" << executedSteps << ": " << hex32(result.pc)
+                      << " " << toString(result.reason) << "\n";
+        }
+    } while (result.reason == CpuStopReason::StepLimit && executedSteps < maxSteps);
+    result.steps = executedSteps;
+    if (std::getenv("PSXREBORN_STATE") != nullptr) {
+        for (uint8_t index = 1; index < 32; ++index) {
+            const uint32_t value = cpu.reg(index);
+            if (value != 0) {
+                std::cerr << "r" << static_cast<unsigned>(index) << ": " << hex32(value) << "\n";
+            }
+        }
+        std::cerr << "hi: " << hex32(cpu.hi()) << "\n";
+        std::cerr << "lo: " << hex32(cpu.lo()) << "\n";
+        for (unsigned index = 0; index < 3; ++index) {
+            std::cerr << "timer" << index << ": count="
+                      << system.timers().count(index) << " mode=" << hex32(system.timers().mode(index))
+                      << " target=" << system.timers().target(index) << "\n";
+        }
+        std::cerr << "cop0 status: " << hex32(cpu.status()) << "\n";
+    }
+    if (const char* dump = std::getenv("PSXREBORN_DUMP")) {
+        const std::string spec(dump);
+        const size_t colon = spec.find(':');
+        if (colon != std::string::npos) {
+            const std::optional<uint32_t> address = parseHex32(spec.substr(0, colon));
+            const std::optional<uint32_t> count = parseHex32(spec.substr(colon + 1));
+            if (address && count) {
+                for (uint32_t index = 0; index < *count; ++index) {
+                    uint32_t value = 0;
+                    memory.read32(*address + index * 4u, value);
+                    std::cerr << hex32(*address + index * 4u) << ": " << hex32(value) << "\n";
+                }
+            }
+        }
+    }
     if (const char* vramPath = std::getenv("PSXREBORN_VRAM")) {
         std::ofstream out(vramPath, std::ios::binary);
         if (out) {

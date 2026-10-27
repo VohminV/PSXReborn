@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,7 @@ constexpr uint16_t kBtnTriangle = 1u << 12;
 constexpr uint16_t kBtnCircle = 1u << 13;
 constexpr uint16_t kBtnCross = 1u << 14;
 constexpr uint16_t kBtnSquare = 1u << 15;
+constexpr uint64_t kCyclesPerFrame = 33868800u / 60u;
 
 uint16_t g_pad = 0xFFFFu;
 
@@ -64,6 +66,7 @@ int main(int argc, char** argv) {
     Cpu* cpuPtr = nullptr;
     System* systemPtr = nullptr;
     Bios* biosPtr = nullptr;
+    std::unique_ptr<CdImage> disc;
 
     // Boot disc or exe
     if (path.size() > 4 && path.substr(path.size() - 4) == ".exe") {
@@ -93,11 +96,12 @@ int main(int argc, char** argv) {
                              image.header.stackBase, image.header.stackOffset);
     } else {
         std::string error;
-        std::optional<CdImage> disc = CdImage::open(path, error);
-        if (!disc) {
+        std::optional<CdImage> opened = CdImage::open(path, error);
+        if (!opened) {
             std::cerr << "disc error: " << error << "\n";
             return 1;
         }
+        disc = std::make_unique<CdImage>(std::move(*opened));
         std::string stackLine;
         const std::optional<std::string> boot = disc->bootExecutable(stackLine);
         if (!boot) {
@@ -126,8 +130,8 @@ int main(int argc, char** argv) {
         systemPtr->reset();
         systemPtr->bind(*cpuPtr);
         biosPtr->reset();
-        biosPtr->attachDisc(&*disc);
-        systemPtr->cdrom().attachDisc(&*disc);
+        biosPtr->attachDisc(disc.get());
+        systemPtr->cdrom().attachDisc(disc.get());
         biosPtr->install();
         cpuPtr->setExecutionMode(CpuExecutionMode::Hardware);
 
@@ -149,7 +153,6 @@ int main(int argc, char** argv) {
     Bios& bios = *biosPtr;
 
     // SDL init
-    SDL_EventState(SDL_QUIT, SDL_IGNORE);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
         std::cerr << "SDL init failed: " << SDL_GetError() << "\n";
         return 1;
@@ -158,6 +161,9 @@ int main(int argc, char** argv) {
                                           640, 480, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     if (!window) { std::cerr << "window fail: " << SDL_GetError() << "\n"; return 1; }
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer) {
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    }
     if (!renderer) { std::cerr << "renderer fail: " << SDL_GetError() << "\n"; return 1; }
     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, 1024, 512);
     if (!texture) { std::cerr << "texture fail: " << SDL_GetError() << "\n"; return 1; }
@@ -172,8 +178,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    const char* dumpPath = std::getenv("PSXREBORN_PLAY_DUMP");
+    uint64_t dumpSteps = 0;
+    if (const char* value = std::getenv("PSXREBORN_PLAY_STEPS")) {
+        dumpSteps = std::strtoull(value, nullptr, 10);
+    }
+    uint64_t totalSteps = 0;
+
     bool running = true;
     while (running) {
+        const uint32_t frameStart = SDL_GetTicks();
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) {
@@ -223,7 +237,8 @@ int main(int argc, char** argv) {
         bios.setPadButtons(g_pad);
 
         // Run CPU
-        CpuRunResult result = cpu.run(100000);
+        CpuRunResult result = cpu.run(kCyclesPerFrame);
+        totalSteps += result.steps;
         if (result.reason != CpuStopReason::StepLimit && result.reason != CpuStopReason::Syscall &&
             result.reason != CpuStopReason::Breakpoint) {
             std::cerr << "CPU stop: " << toString(result.reason) << " pc=" << result.pc << "\n";
@@ -244,10 +259,56 @@ int main(int argc, char** argv) {
             SDL_UnlockTexture(texture);
         }
         SDL_RenderClear(renderer);
-        SDL_RenderCopy(renderer, texture, nullptr, nullptr);
+        if (!system.gpu().displayDisabled()) {
+            uint32_t srcX = system.gpu().displayStartX();
+            uint32_t srcY = system.gpu().displayStartY();
+            uint32_t srcW = system.gpu().displayWidth();
+            uint32_t srcH = system.gpu().displayHeight();
+            if (srcX >= Gpu::kVramWidth) {
+                srcW = 0;
+            } else if (srcW > Gpu::kVramWidth - srcX) {
+                srcW = Gpu::kVramWidth - srcX;
+            }
+            if (srcY >= Gpu::kVramHeight) {
+                srcH = 0;
+            } else if (srcH > Gpu::kVramHeight - srcY) {
+                srcH = Gpu::kVramHeight - srcY;
+            }
+            if (srcW != 0 && srcH != 0) {
+                const SDL_Rect source{static_cast<int>(srcX), static_cast<int>(srcY),
+                                      static_cast<int>(srcW), static_cast<int>(srcH)};
+                SDL_RenderCopy(renderer, texture, &source, nullptr);
+            }
+        }
         SDL_RenderPresent(renderer);
 
-        SDL_Delay(16);
+        if (dumpPath != nullptr && dumpSteps != 0 && totalSteps >= dumpSteps) {
+            std::cerr << "[PLAY] display x=" << system.gpu().displayStartX()
+                      << " y=" << system.gpu().displayStartY()
+                      << " w=" << system.gpu().displayWidth()
+                      << " h=" << system.gpu().displayHeight()
+                      << " mode=0x" << std::hex << system.gpu().displayMode() << std::dec
+                      << " disabled=" << system.gpu().displayDisabled() << "\n";
+            std::ofstream out(dumpPath, std::ios::binary);
+            if (out) {
+                const auto& vram = system.gpu().vram();
+                out << "P6\n" << Gpu::kVramWidth << " " << Gpu::kVramHeight << "\n255\n";
+                for (uint16_t pixel : vram) {
+                    const uint8_t r = static_cast<uint8_t>((pixel & 0x1Fu) << 3);
+                    const uint8_t g = static_cast<uint8_t>(((pixel >> 5u) & 0x1Fu) << 3);
+                    const uint8_t b = static_cast<uint8_t>(((pixel >> 10u) & 0x1Fu) << 3);
+                    const char rgb[3] = {static_cast<char>(r), static_cast<char>(g),
+                                         static_cast<char>(b)};
+                    out.write(rgb, 3);
+                }
+            }
+            running = false;
+        }
+
+        const uint32_t elapsed = SDL_GetTicks() - frameStart;
+        if (elapsed < 16u) {
+            SDL_Delay(16u - elapsed);
+        }
     }
 
     if (controller) {

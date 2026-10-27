@@ -1,4 +1,5 @@
 #include "psxreborn/hardware.hpp"
+#include <iostream>
 
 #include "psxreborn/cpu.hpp"
 #include "psxreborn/memory.hpp"
@@ -269,6 +270,9 @@ void System::tick(uint32_t cycles) {
             vblankHandler_();
         }
     }
+    if (irqHandler_) {
+        irqHandler_();
+    }
 }
 
 bool System::irqPending() const {
@@ -296,6 +300,29 @@ bool System::miscIndex(uint32_t address, uint32_t& offset) {
 }
 
 bool System::read8(uint32_t address, uint8_t& value, MemoryFault* fault) {
+    if (address >= 0x1F801050u && address <= 0x1F80105Fu) {
+        if (address == 0x1F801050u) {
+            
+            uint8_t b = 0xFFu;
+            if (sioState_ == 1) {
+                b = 0xFFu;
+            } else if (sioState_ == 2) {
+                if (sioReadIndex_ == 0) b = 0x5Au;
+                else if (sioReadIndex_ == 1) b = static_cast<uint8_t>(padButtons() & 0xFFu);
+                else if (sioReadIndex_ == 2) b = static_cast<uint8_t>((padButtons() >> 8) & 0xFFu);
+                else b = 0x00u;
+                ++sioReadIndex_;
+                if (sioReadIndex_ >= 5) { sioState_ = 0; sioReadIndex_ = 0; }
+            }
+            value = b;
+        } else if (address == 0x1F801054u) {
+            value = 0x05u;
+        } else {
+            value = 0;
+        }
+        setFault(fault, MemoryFault::None);
+        return true;
+    }
     bool handled = false;
     if (cdrom_.read8(address, value, handled)) {
         setFault(fault, MemoryFault::None);
@@ -323,6 +350,23 @@ bool System::read16(uint32_t address, uint16_t& value, MemoryFault* fault) {
 }
 
 bool System::read32(uint32_t address, uint32_t& value, MemoryFault* fault) {
+    if (address >= 0x1F801050u && address <= 0x1F80105Fu) {
+        uint8_t b = 0;
+        if (address == 0x1F801050u) {
+            if (sioState_ == 1) b = 0xFFu;
+            else if (sioState_ == 2) {
+                if (sioReadIndex_ == 0) b = 0x5Au;
+                else if (sioReadIndex_ == 1) b = static_cast<uint8_t>(padButtons() & 0xFFu);
+                else if (sioReadIndex_ == 2) b = static_cast<uint8_t>((padButtons() >> 8) & 0xFFu);
+                else b = 0x00u;
+                ++sioReadIndex_;
+                if (sioReadIndex_ >= 5) { sioState_ = 0; sioReadIndex_ = 0; }
+            } else b = 0xFFu;
+        } else if (address == 0x1F801054u) b = 0x05u;
+        value = b;
+        setFault(fault, MemoryFault::None);
+        return true;
+    }
     if (interrupts_.read32(address, value) || timers_.read32(address, value) ||
         dma_.read32(address, value) || gpu_.read32(address, value, fault) ||
         spu_.read32(address, value)) {
@@ -343,6 +387,16 @@ bool System::read32(uint32_t address, uint32_t& value, MemoryFault* fault) {
 }
 
 bool System::write8(uint32_t address, uint8_t value, MemoryFault* fault) {
+    if (address >= 0x1F801050u && address <= 0x1F80105Fu) {
+        if (address == 0x1F801050u) {
+            
+            if (value == 0x01u) { sioState_ = 1; sioReadIndex_ = 0; }
+            else if (sioState_ == 1 && value == 0x42u) { sioState_ = 2; sioReadIndex_ = 0; }
+            else { sioState_ = 0; sioReadIndex_ = 0; }
+        }
+        setFault(fault, MemoryFault::None);
+        return true;
+    }
     bool handled = false;
     if (cdrom_.write8(address, value, handled)) {
         setFault(fault, MemoryFault::None);
@@ -372,6 +426,16 @@ bool System::write16(uint32_t address, uint16_t value, MemoryFault* fault) {
 }
 
 bool System::write32(uint32_t address, uint32_t value, MemoryFault* fault) {
+    if (address >= 0x1F801050u && address <= 0x1F80105Fu) {
+        if (address == 0x1F801050u) {
+            uint8_t v = static_cast<uint8_t>(value & 0xFFu);
+            if (v == 0x01u) { sioState_ = 1; sioReadIndex_ = 0; }
+            else if (sioState_ == 1 && v == 0x42u) { sioState_ = 2; sioReadIndex_ = 0; }
+            else { sioState_ = 0; sioReadIndex_ = 0; }
+        }
+        setFault(fault, MemoryFault::None);
+        return true;
+    }
     if (interrupts_.write32(address, value) || timers_.write32(address, value) ||
         dma_.write32(address, value) || gpu_.write32(address, value, fault) ||
         spu_.write32(address, value)) {

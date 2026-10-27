@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -22,8 +23,8 @@ public:
     void reset();
     void install();
     void attachDisc(const CdImage* disc) { disc_ = disc; }
-    void setPadButtons(uint16_t buttons) { padButtons_ = buttons; }
-    uint16_t padButtons() const { return padButtons_; }
+    void setPadButtons(uint16_t buttons);
+    uint16_t padButtons() const;
 
     void handleVBlank();
     void handleCdromInterrupt(uint8_t interrupt);
@@ -55,6 +56,9 @@ private:
     bool onInstruction(uint32_t pc);
     bool onSyscall();
     void dispatch(uint8_t vector, uint8_t function);
+    void handleIrq();
+    void enterEntryInt();
+    void leaveEntryInt();
 
     void a0Call(uint8_t function);
     void b0Call(uint8_t function);
@@ -113,7 +117,22 @@ private:
     uint32_t padBuf1_ = 0;
     uint32_t padBuf2_ = 0;
     bool padEnabled_ = false;
-    uint16_t padButtons_ = 0xFFFFu;
+
+    static constexpr uint32_t kEntryIntReturn = 0xFFFFFFFFu;
+    static constexpr uint32_t kEntryIntFrameSize = 0x30u;
+
+    struct SavedCpuState {
+        std::array<uint32_t, 32> regs{};
+        uint32_t pc = 0;
+        uint32_t hi = 0;
+        uint32_t lo = 0;
+    };
+
+    uint32_t entryInt_ = 0;
+    bool inEntryInt_ = false;
+    bool inBiosCall_ = false;
+    bool returnFromException_ = false;
+    SavedCpuState savedState_{};
 };
 
 }  // namespace psxreborn

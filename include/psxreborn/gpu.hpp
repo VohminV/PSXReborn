@@ -32,6 +32,13 @@ public:
     void setVram(uint32_t x, uint32_t y, uint16_t value);
     const std::vector<uint16_t>& vram() const { return vram_; }
 
+    uint32_t displayStartX() const { return displayStart_ & 0x3FFu; }
+    uint32_t displayStartY() const { return (displayStart_ >> 10) & 0x1FFu; }
+    uint32_t displayWidth() const;
+    uint32_t displayHeight() const;
+    uint32_t displayMode() const { return displayMode_; }
+    bool displayDisabled() const { return displayDisabled_; }
+
 private:
     enum class Transfer {
         None,

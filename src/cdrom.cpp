@@ -1,6 +1,8 @@
 #include "psxreborn/cdrom.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
@@ -11,6 +13,11 @@
 namespace psxreborn {
 
 namespace {
+
+bool cdTrace() {
+    static const bool enabled = std::getenv("PSXREBORN_CD_LOG") != nullptr;
+    return enabled;
+}
 
 std::string lower(std::string value) {
     for (char& character : value) {
@@ -458,6 +465,9 @@ void Cdrom::reset() {
     cyclesPerSector_ = 33868800u / 75u;
     parameterCount_ = 0;
     response_.clear();
+    secondResponseCycles_ = 0;
+    secondResponseInterrupt_ = 0;
+    secondResponseSize_ = 0;
     sectorPosition_ = 0;
     sectorLength_ = 0;
     sectorReady_ = false;
@@ -523,14 +533,21 @@ bool Cdrom::read8(uint32_t address, uint8_t& value, bool& handled) {
     const uint32_t port = address - kBaseAddress;
     if (port == 0) {
         value = indexStatus();
+        if (cdTrace()) {
+            std::cerr << "[CD] r status = " << std::hex << static_cast<unsigned>(value) << std::dec << "\n";
+        }
         return true;
     }
     if (port == 1) {
-        if (index_ == 0 && !response_.empty()) {
+        if (!response_.empty()) {
             value = response_.front();
             response_.pop_front();
         } else {
             value = 0;
+        }
+        if (cdTrace()) {
+            std::cerr << "[CD] r resp = " << std::hex << static_cast<unsigned>(value)
+                      << std::dec << " left=" << response_.size() << "\n";
         }
         return true;
     }
@@ -550,6 +567,10 @@ bool Cdrom::read8(uint32_t address, uint8_t& value, bool& handled) {
     } else {
         value = static_cast<uint8_t>(interruptEnable_ | 0xE0u);
     }
+    if (cdTrace()) {
+        std::cerr << "[CD] r idx" << static_cast<unsigned>(index_) << " port" << port
+                  << " = " << std::hex << static_cast<unsigned>(value) << std::dec << "\n";
+    }
     return true;
 }
 
@@ -560,6 +581,10 @@ bool Cdrom::write8(uint32_t address, uint8_t value, bool& handled) {
     }
     handled = true;
     const uint32_t port = address - kBaseAddress;
+    if (cdTrace() && port != 2) {
+        std::cerr << "[CD] w idx" << static_cast<unsigned>(index_) << " port" << port
+                  << " = " << std::hex << static_cast<unsigned>(value) << std::dec << "\n";
+    }
     if (port == 0) {
         index_ = value & 0x03u;
         return true;
@@ -619,9 +644,20 @@ void Cdrom::acknowledgeInterrupt(uint8_t bits) {
 }
 
 void Cdrom::pushResponse(uint8_t interrupt, std::initializer_list<uint8_t> data) {
+    pushResponse(interrupt, data.begin(), data.size());
+}
+
+void Cdrom::pushResponse(uint8_t interrupt, const uint8_t* data, size_t size) {
+    if (cdTrace()) {
+        std::cerr << "[CD] int " << std::hex << static_cast<unsigned>(interrupt) << std::dec << " data";
+        for (size_t index = 0; index < size; ++index) {
+            std::cerr << " " << std::hex << static_cast<unsigned>(data[index]) << std::dec;
+        }
+        std::cerr << "\n";
+    }
     response_.clear();
-    for (uint8_t byte : data) {
-        response_.push_back(byte);
+    for (size_t index = 0; index < size; ++index) {
+        response_.push_back(data[index]);
     }
     interruptFlag_ = interrupt;
     updateInterrupt();
@@ -630,11 +666,32 @@ void Cdrom::pushResponse(uint8_t interrupt, std::initializer_list<uint8_t> data)
     }
 }
 
+void Cdrom::scheduleSecondResponse(uint8_t interrupt, uint32_t cycles,
+                                   std::initializer_list<uint8_t> data) {
+    secondResponseInterrupt_ = interrupt;
+    secondResponseCycles_ = std::max<uint32_t>(cycles, 1u);
+    secondResponseSize_ = 0;
+    for (uint8_t byte : data) {
+        if (secondResponseSize_ >= secondResponseData_.size()) {
+            break;
+        }
+        secondResponseData_[secondResponseSize_++] = byte;
+    }
+}
+
 void Cdrom::setError(uint8_t code) {
     pushResponse(0x05u, {statusByte(), code});
 }
 
 void Cdrom::executeCommand(uint8_t command) {
+    if (cdTrace()) {
+        std::cerr << "[CD] cmd " << std::hex << static_cast<unsigned>(command) << std::dec
+                  << " params=" << parameterCount_;
+        for (uint32_t i = 0; i < parameterCount_; ++i) {
+            std::cerr << " " << std::hex << static_cast<unsigned>(parameter_[i]) << std::dec;
+        }
+        std::cerr << " seek=" << seekLba_ << "\n";
+    }
     switch (command) {
         case 0x00:  // Sync
             motorOn_ = true;
@@ -661,6 +718,12 @@ void Cdrom::executeCommand(uint8_t command) {
             currentLba_ = seekLba_;
             pushResponse(0x03u, {statusByte()});
             break;
+        case 0x07:  // Standby
+            motorOn_ = true;
+            state_ = State::Idle;
+            pushResponse(0x03u, {statusByte()});
+            scheduleSecondResponse(0x02u, 50000u, {statusByte()});
+            break;
         case 0x06:  // ReadN
             if (disc_ == nullptr) {
                 setError(0x40);
@@ -677,10 +740,12 @@ void Cdrom::executeCommand(uint8_t command) {
             state_ = State::Idle;
             motorOn_ = false;
             pushResponse(0x03u, {statusByte()});
+            scheduleSecondResponse(0x02u, 50000u, {statusByte()});
             break;
         case 0x09:  // Pause
             state_ = State::Idle;
             pushResponse(0x03u, {statusByte()});
+            scheduleSecondResponse(0x02u, 50000u, {statusByte()});
             break;
         case 0x0A:  // Init
             motorOn_ = true;
@@ -688,6 +753,7 @@ void Cdrom::executeCommand(uint8_t command) {
             state_ = State::Idle;
             currentLba_ = seekLba_;
             pushResponse(0x03u, {statusByte()});
+            scheduleSecondResponse(0x02u, 0x20000u, {statusByte()});
             break;
         case 0x0B:  // Mute
         case 0x0C:  // Demute
@@ -718,6 +784,10 @@ void Cdrom::executeCommand(uint8_t command) {
             pushResponse(0x03u, {0x01, 0x01, minute, second, frame, minute, second, frame});
             break;
         }
+        case 0x12:  // SetSession
+            pushResponse(0x03u, {statusByte()});
+            scheduleSecondResponse(0x02u, 50000u, {statusByte()});
+            break;
         case 0x13:  // GetTN
             pushResponse(0x03u, {statusByte(), 0x01, 0x01});
             break;
@@ -729,6 +799,7 @@ void Cdrom::executeCommand(uint8_t command) {
             motorOn_ = true;
             currentLba_ = seekLba_;
             pushResponse(0x03u, {statusByte()});
+            scheduleSecondResponse(0x02u, 50000u, {statusByte()});
             break;
         case 0x19:  // Test
             if (parameterCount_ >= 1 && parameter_[0] == 0x20) {
@@ -740,9 +811,12 @@ void Cdrom::executeCommand(uint8_t command) {
         case 0x1A:  // GetID
             motorOn_ = true;
             pushResponse(0x03u, {statusByte()});
+            scheduleSecondResponse(0x02u, 50000u,
+                                   {statusByte(), 0x00, 0x20, 0x00, 'S', 'C', 'E', 'x'});
             break;
         case 0x1E:  // ReadTOC
             pushResponse(0x03u, {statusByte()});
+            scheduleSecondResponse(0x02u, 50000u, {statusByte()});
             break;
         default:
             setError(0x40);
@@ -752,6 +826,17 @@ void Cdrom::executeCommand(uint8_t command) {
 }
 
 void Cdrom::tick(uint32_t cycles) {
+    if (secondResponseCycles_ != 0) {
+        if (cycles >= secondResponseCycles_) {
+            secondResponseCycles_ = 0;
+            std::array<uint8_t, 8> data = secondResponseData_;
+            const uint32_t size = secondResponseSize_;
+            secondResponseSize_ = 0;
+            pushResponse(secondResponseInterrupt_, data.data(), size);
+        } else {
+            secondResponseCycles_ -= cycles;
+        }
+    }
     if (state_ != State::Reading) {
         return;
     }

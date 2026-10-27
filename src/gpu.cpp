@@ -158,6 +158,28 @@ uint32_t Gpu::status() const {
     return value;
 }
 
+uint32_t Gpu::displayWidth() const {
+    if ((displayMode_ & 0x40u) != 0) {
+        return 368u;
+    }
+    switch (displayMode_ & 3u) {
+        case 0:
+            return 256u;
+        case 1:
+            return 320u;
+        case 2:
+            return 512u;
+        case 3:
+            return 640u;
+        default:
+            return 320u;
+    }
+}
+
+uint32_t Gpu::displayHeight() const {
+    return (displayMode_ & 0x04u) != 0 ? 480u : 240u;
+}
+
 bool Gpu::read32(uint32_t address, uint32_t& value, MemoryFault* fault) {
     if (address == kGp0Address) {
         readGp0(value);
@@ -548,7 +570,7 @@ void Gpu::executeGp1(uint32_t word) {
     } else if (opcode == 0x07u) {
         verticalRange_ = word & 0x00FFFFFFu;
     } else if (opcode == 0x08u) {
-        displayMode_ = word & 0x3Fu;
+        displayMode_ = word & 0xFFu;
     } else if (opcode == 0x10u) {
         const uint32_t info = word & 0x0Fu;
         if (info == 0) {

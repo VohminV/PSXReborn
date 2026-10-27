@@ -6,6 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 option(PSXREBORN_BUILD_TESTS "Build PSXReborn tests" ON)
 option(PSXREBORN_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
@@ -46,6 +50,7 @@ psxreborn_enable_warnings(psxreborn)
 if(PSXREBORN_BUILD_TESTS)
     enable_testing()
     add_executable(psxreborn_tests
+        tests/test_bios.cpp
         tests/test_cop0.cpp
         tests/test_cpu.cpp
         tests/test_end_to_end.cpp

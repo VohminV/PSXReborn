@@ -96,6 +96,9 @@ public:
 
     bool halted() const { return halted_; }
     CpuStopReason haltReason() const { return haltReason_; }
+    bool inDelaySlot() const { return inDelaySlot_; }
+    bool pendingLoadActive() const { return pendingLoad_.active; }
+    bool interruptPending() const;
 
 private:
     struct PendingLoad {
@@ -111,7 +114,6 @@ private:
     CpuStepResult coprocessorUnusable(uint32_t pc, uint32_t instruction, uint8_t coprocessor);
     void raiseException(CpuException exception, uint32_t badAddress = 0, uint8_t coprocessor = 0);
     void syncInterruptCause();
-    bool interruptPending() const;
     void rfe();
     bool cop0Usable() const;
     static bool validCop0Register(uint8_t index);

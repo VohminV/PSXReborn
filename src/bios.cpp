@@ -1,6 +1,7 @@
 #include "psxreborn/bios.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstdarg>
 #include <cstdio>
@@ -29,6 +30,27 @@ constexpr uint32_t kEventVBlankSpec = 0x20u;
 constexpr uint32_t kEventCdromA = 0xF4000001u;
 constexpr uint32_t kEventCdromB = 0xF0000011u;
 constexpr uint32_t kCyclesPerFrame = 33868800u / 60u;
+
+int32_t parseDecimal(const std::string& text) {
+    size_t index = 0;
+    while (index < text.size() && std::isspace(static_cast<unsigned char>(text[index])) != 0) {
+        ++index;
+    }
+    bool negative = false;
+    if (index < text.size() && (text[index] == '+' || text[index] == '-')) {
+        negative = text[index] == '-';
+        ++index;
+    }
+    int64_t value = 0;
+    while (index < text.size() && std::isdigit(static_cast<unsigned char>(text[index])) != 0) {
+        value = value * 10 + (text[index] - '0');
+        ++index;
+    }
+    if (negative) {
+        value = -value;
+    }
+    return static_cast<int32_t>(value);
+}
 
 }  // namespace
 
@@ -64,18 +86,26 @@ void Bios::padStop() {
     padEnabled_ = false;
 }
 
+void Bios::setPadButtons(uint16_t buttons) {
+    system_.setPadButtons(buttons);
+}
+
+uint16_t Bios::padButtons() const {
+    return system_.padButtons();
+}
+
 void Bios::padUpdate() {
     if (padBuf1_ != 0) {
         memory_.write8(padBuf1_ + 0, 0);
         memory_.write8(padBuf1_ + 1, 0x41);
-        memory_.write8(padBuf1_ + 2, static_cast<uint8_t>(padButtons_ & 0xFFu));
-        memory_.write8(padBuf1_ + 3, static_cast<uint8_t>((padButtons_ >> 8) & 0xFFu));
+        memory_.write8(padBuf1_ + 2, static_cast<uint8_t>(system_.padButtons() & 0xFFu));
+        memory_.write8(padBuf1_ + 3, static_cast<uint8_t>((system_.padButtons() >> 8) & 0xFFu));
     }
     if (padBuf2_ != 0) {
         memory_.write8(padBuf2_ + 0, 0);
         memory_.write8(padBuf2_ + 1, 0x41);
-        memory_.write8(padBuf2_ + 2, static_cast<uint8_t>(padButtons_ & 0xFFu));
-        memory_.write8(padBuf2_ + 3, static_cast<uint8_t>((padButtons_ >> 8) & 0xFFu));
+        memory_.write8(padBuf2_ + 2, static_cast<uint8_t>(system_.padButtons() & 0xFFu));
+        memory_.write8(padBuf2_ + 3, static_cast<uint8_t>((system_.padButtons() >> 8) & 0xFFu));
     }
 }
 
@@ -101,6 +131,7 @@ void Bios::install() {
     cpu_.setInstructionHook([this](uint32_t pc) { return onInstruction(pc); });
     cpu_.setSyscallHandler([this]() { return onSyscall(); });
     system_.setVBlankHandler([this]() { handleVBlank(); });
+    system_.setIrqHandler([this]() { handleIrq(); });
     system_.cdrom().setInterruptCallback([this](uint8_t interrupt) {
         handleCdromInterrupt(interrupt);
     });
@@ -138,7 +169,79 @@ void Bios::handleCdromInterrupt(uint8_t interrupt) {
     deliverEventClass(kEventCdromB, spec);
 }
 
+void Bios::handleIrq() {
+    if (entryInt_ == 0 || inEntryInt_ || inBiosCall_ || cpu_.halted()) {
+        return;
+    }
+    if (cpu_.inDelaySlot() || cpu_.pendingLoadActive()) {
+        return;
+    }
+    if ((cpu_.status() & 0x404u) != 0x404u || !system_.irqPending()) {
+        return;
+    }
+    enterEntryInt();
+}
+
+void Bios::enterEntryInt() {
+    const uint32_t sp = read32(entryInt_ + 4);
+    if (sp < 0x80000000u || sp >= 0x80200000u || (sp & 3u) != 0) {
+        static bool warned = false;
+        if (!warned) {
+            std::cerr << "[BIOS] invalid HookEntryInt stack 0x" << std::hex << sp << std::dec
+                      << "\n";
+            warned = true;
+        }
+        return;
+    }
+
+    for (uint32_t index = 0; index < 32; ++index) {
+        savedState_.regs[index] = cpu_.reg(static_cast<uint8_t>(index));
+    }
+    savedState_.pc = cpu_.pc();
+    savedState_.hi = cpu_.hi();
+    savedState_.lo = cpu_.lo();
+
+    write32(sp + 20, kEntryIntReturn);
+
+    cpu_.setReg(kRa, read32(entryInt_ + 0));
+    cpu_.setReg(kSp, sp);
+    cpu_.setReg(30, read32(entryInt_ + 8));
+    for (uint32_t index = 0; index < 8; ++index) {
+        cpu_.setReg(static_cast<uint8_t>(16 + index), read32(entryInt_ + 12 + index * 4));
+    }
+    cpu_.setReg(28, read32(entryInt_ + 44));
+    cpu_.setReg(kV0, 1);
+    cpu_.setPc(read32(entryInt_ + 0));
+    inEntryInt_ = true;
+}
+
+void Bios::leaveEntryInt() {
+    for (uint32_t index = 0; index < 32; ++index) {
+        cpu_.setReg(static_cast<uint8_t>(index), savedState_.regs[index]);
+    }
+    cpu_.setHiLo(savedState_.hi, savedState_.lo);
+    cpu_.setPc(savedState_.pc);
+    inEntryInt_ = false;
+    static const bool irqTrace = std::getenv("PSXREBORN_IRQ_LOG") != nullptr;
+    if (irqTrace) {
+        uint32_t stat = 0;
+        uint32_t mask = 0;
+        system_.interrupts().read32(0x1F801070u, stat);
+        system_.interrupts().read32(0x1F801074u, mask);
+        std::cerr << "[IRQ] leave pc=0x" << std::hex << savedState_.pc << " stat=0x" << stat
+                  << " mask=0x" << mask << std::dec << "\n";
+    }
+}
+
 bool Bios::onInstruction(uint32_t pc) {
+    if (pc == kEntryIntReturn) {
+        if (inEntryInt_) {
+            leaveEntryInt();
+            return true;
+        }
+        return false;
+    }
+
     uint8_t vector = 0;
     uint8_t function = 0;
     const uint32_t low = pc & 0xFFFFFFu;
@@ -164,8 +267,17 @@ bool Bios::onInstruction(uint32_t pc) {
         return false;
     }
 
+    inBiosCall_ = true;
     dispatch(vector, function);
-    cpu_.setPc(cpu_.reg(kRa));
+    inBiosCall_ = false;
+    if (returnFromException_) {
+        returnFromException_ = false;
+        if (inEntryInt_) {
+            leaveEntryInt();
+        }
+    } else {
+        cpu_.setPc(cpu_.reg(kRa));
+    }
     return true;
 }
 
@@ -364,7 +476,7 @@ uint32_t Bios::openFile(const std::string& path, uint32_t mode) {
     }
     std::vector<uint8_t> data;
     if (!disc_->readFile(normalized, data)) {
-        std::cerr << "[BIOS] open failed: " << path << "\n";
+        
         return 0xFFFFFFFFu;
     }
     for (size_t index = 3; index < files_.size(); ++index) {
@@ -372,12 +484,14 @@ uint32_t Bios::openFile(const std::string& path, uint32_t mode) {
             files_[index].used = true;
             files_[index].data = std::move(data);
             files_[index].position = 0;
+            
             return static_cast<uint32_t>(index);
         }
     }
     files_.push_back({});
     files_.back().used = true;
     files_.back().data = std::move(data);
+    
     return static_cast<uint32_t>(files_.size() - 1);
 }
 
@@ -392,6 +506,7 @@ uint32_t Bios::readFile(uint32_t fd, uint32_t address, uint32_t size) {
         memory_.writeBytes(address, file.data.data() + file.position, count);
         file.position += count;
     }
+    
     return static_cast<uint32_t>(count);
 }
 
@@ -439,14 +554,27 @@ uint32_t Bios::closeFile(uint32_t fd) {
 }
 
 uint32_t Bios::openEvent(uint32_t classId, uint32_t specId, uint32_t mode, uint32_t handler) {
+    uint32_t id = 0;
+    bool reused = false;
     for (size_t index = 0; index < events_.size(); ++index) {
         if (!events_[index].active) {
             events_[index] = Event{classId, specId, mode, handler, false, false, false, true};
-            return static_cast<uint32_t>(index);
+            id = static_cast<uint32_t>(index);
+            reused = true;
+            break;
         }
     }
-    events_.push_back(Event{classId, specId, mode, handler, false, false, false, true});
-    return static_cast<uint32_t>(events_.size() - 1);
+    if (!reused) {
+        events_.push_back(Event{classId, specId, mode, handler, false, false, false, true});
+        id = static_cast<uint32_t>(events_.size() - 1);
+    }
+    static const bool eventTrace = std::getenv("PSXREBORN_EVENT_LOG") != nullptr;
+    if (eventTrace) {
+        std::cerr << "[EVENT] open id=" << id << " class=0x" << std::hex << classId
+                  << " spec=0x" << specId << " mode=0x" << mode << " handler=0x" << handler
+                  << std::dec << "\n";
+    }
+    return id;
 }
 
 uint32_t Bios::closeEvent(uint32_t id) {
@@ -464,6 +592,7 @@ uint32_t Bios::waitEvent(uint32_t id) {
     if (id >= events_.size() || !events_[id].active) {
         return 0;
     }
+
     for (unsigned attempt = 0; attempt < kCyclesPerFrame / 1024u; ++attempt) {
         Event& event = events_[id];
         if (event.triggered) {
@@ -499,9 +628,16 @@ void Bios::deliverEvent(uint32_t id) {
 }
 
 void Bios::deliverEventClass(uint32_t classId, uint32_t specId) {
-    for (Event& event : events_) {
+    static const bool eventTrace = std::getenv("PSXREBORN_EVENT_LOG") != nullptr;
+    for (size_t index = 0; index < events_.size(); ++index) {
+        Event& event = events_[index];
         if (!event.active || event.classId != classId || event.specId != specId) {
             continue;
+        }
+        if (eventTrace) {
+            std::cerr << "[EVENT] deliver id=" << index << " class=0x" << std::hex << classId
+                      << " spec=0x" << specId << " enabled=" << std::dec << event.enabled
+                      << " handler=0x" << std::hex << event.handler << std::dec << "\n";
         }
         if (!event.enabled) {
             event.pending = true;
@@ -650,14 +786,39 @@ void Bios::a0Call(uint8_t function) {
             cpu_.setReg(kV0, static_cast<uint32_t>(result));
             return;
         }
-        case 0x13:
+        case 0x0E:
+        case 0x0F:
+            cpu_.setReg(kV0, static_cast<uint32_t>(
+                                 std::abs(static_cast<int32_t>(cpu_.reg(kA0)))));
+            return;
+        case 0x10:
+        case 0x11:
+            cpu_.setReg(kV0, static_cast<uint32_t>(parseDecimal(readString(cpu_.reg(kA0)))));
+            return;
+        case 0x13: {
+            const uint32_t buffer = cpu_.reg(kA0);
+            write32(buffer + 0, cpu_.reg(kRa));
+            write32(buffer + 4, cpu_.reg(kSp));
+            write32(buffer + 8, cpu_.reg(30));
+            for (uint32_t index = 0; index < 8; ++index) {
+                write32(buffer + 12 + index * 4, cpu_.reg(static_cast<uint8_t>(16 + index)));
+            }
+            write32(buffer + 44, cpu_.reg(28));
             cpu_.setReg(kV0, 0);
             return;
-        case 0x14:
-            std::cerr << "[BIOS] longjmp(0x" << std::hex << cpu_.reg(kA0) << std::dec
-                      << ") unsupported\n";
-            cpu_.setReg(kV0, 0);
+        }
+        case 0x14: {
+            const uint32_t buffer = cpu_.reg(kA0);
+            cpu_.setReg(kRa, read32(buffer + 0));
+            cpu_.setReg(kSp, read32(buffer + 4));
+            cpu_.setReg(30, read32(buffer + 8));
+            for (uint32_t index = 0; index < 8; ++index) {
+                cpu_.setReg(static_cast<uint8_t>(16 + index), read32(buffer + 12 + index * 4));
+            }
+            cpu_.setReg(28, read32(buffer + 44));
+            cpu_.setReg(kV0, cpu_.reg(kA1));
             return;
+        }
         case 0x15: {
             const uint32_t destination = cpu_.reg(kA0);
             std::string text = readString(destination) + readString(cpu_.reg(kA1));
@@ -715,6 +876,15 @@ void Bios::a0Call(uint8_t function) {
             cpu_.setReg(kV0, position == std::string::npos
                                  ? 0
                                  : cpu_.reg(kA0) + static_cast<uint32_t>(position));
+            return;
+        }
+        case 0x24: {
+            const uint32_t haystack = cpu_.reg(kA0);
+            const std::string text = readString(haystack);
+            const size_t position = text.find(readString(cpu_.reg(kA1)));
+            cpu_.setReg(kV0, position == std::string::npos
+                                 ? 0
+                                 : haystack + static_cast<uint32_t>(position));
             return;
         }
         case 0x27: {
@@ -901,7 +1071,7 @@ void Bios::b0Call(uint8_t function) {
             cpu_.setReg(kV0, 0);
             return;
         case 0x07:
-            deliverEvent(cpu_.reg(kA0));
+            deliverEventClass(cpu_.reg(kA0), cpu_.reg(kA1));
             return;
         case 0x08:
             cpu_.setReg(kV0, openEvent(cpu_.reg(kA0), cpu_.reg(kA1), cpu_.reg(kA2),
@@ -958,26 +1128,39 @@ void Bios::b0Call(uint8_t function) {
             cpu_.setReg(kV0, 2);
             return;
         case 0x16: {
-            uint32_t buttons = padButtons_;
+            uint32_t buttons = system_.padButtons();
             if (padBuf1_ != 0) {
                 memory_.write8(padBuf1_ + 0, 0);
                 memory_.write8(padBuf1_ + 1, 0x41);
                 memory_.write8(padBuf1_ + 2, static_cast<uint8_t>(buttons & 0xFFu));
                 memory_.write8(padBuf1_ + 3, static_cast<uint8_t>((buttons >> 8) & 0xFFu));
             }
-            cpu_.setReg(kV0, (static_cast<uint32_t>(padButtons_ >> 8) << 0) |
-                             (static_cast<uint32_t>(padButtons_ & 0xFFu) << 8));
+            cpu_.setReg(kV0, (static_cast<uint32_t>(system_.padButtons() >> 8) << 0) |
+                             (static_cast<uint32_t>(system_.padButtons() & 0xFFu) << 8));
             return;
         }
+        case 0x17:
+            returnFromException_ = true;
+            cpu_.setReg(kV0, 0);
+            return;
         case 0x18:
+            cpu_.setReg(kV0, 0);
+            return;
         case 0x19:
+            entryInt_ = cpu_.reg(kA0);
             cpu_.setReg(kV0, 0);
             return;
         case 0x20: {
-            const uint32_t id = cpu_.reg(kA0);
-            if (id < events_.size() && events_[id].active) {
-                events_[id].triggered = false;
-                events_[id].pending = false;
+            const uint32_t classId = cpu_.reg(kA0);
+            const uint32_t specId = cpu_.reg(kA1);
+            for (Event& event : events_) {
+                if (!event.active || event.classId != classId || event.specId != specId) {
+                    continue;
+                }
+                if (event.mode == 0x2000u) {
+                    event.triggered = false;
+                    event.pending = false;
+                }
             }
             cpu_.setReg(kV0, 0);
             return;

@@ -36,7 +36,10 @@ TEST_CASE(interrupts_mask_status_and_acknowledge) {
     CHECK(memory.read32(Interrupts::kStatAddress, value));
     CHECK_EQ(value, 0u);
 
-    CHECK(memory.read32(0x1F801000u, value, &fault) == false);
+    CHECK(memory.read32(0x1F801000u, value, &fault));
+    CHECK_EQ(value, 0x1F000000u);
+    CHECK_EQ(static_cast<unsigned>(fault), static_cast<unsigned>(MemoryFault::None));
+    CHECK(memory.read32(0x1F802000u, value, &fault) == false);
     CHECK_EQ(static_cast<unsigned>(fault), static_cast<unsigned>(MemoryFault::Unsupported));
 }
 
@@ -238,6 +241,37 @@ TEST_CASE(gpu_gp1_info_and_display_control) {
     CHECK((value & (1u << 23)) != 0);
 }
 
+TEST_CASE(gpu_display_area_registers) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+
+    CHECK(memory.write32(Gpu::kGp1Address, 0x05000000u | (100u << 10) | 40u));
+    CHECK_EQ(system.gpu().displayStartX(), 40u);
+    CHECK_EQ(system.gpu().displayStartY(), 100u);
+
+    CHECK(memory.write32(Gpu::kGp1Address, 0x08000000u | 0x09u));
+    CHECK_EQ(system.gpu().displayWidth(), 320u);
+    CHECK_EQ(system.gpu().displayHeight(), 240u);
+    CHECK_EQ(system.gpu().displayMode(), 0x09u);
+
+    CHECK(memory.write32(Gpu::kGp1Address, 0x08000000u | 0x0Au));
+    CHECK_EQ(system.gpu().displayWidth(), 512u);
+    CHECK_EQ(system.gpu().displayHeight(), 240u);
+
+    CHECK(memory.write32(Gpu::kGp1Address, 0x08000000u | 0x40u));
+    CHECK_EQ(system.gpu().displayWidth(), 368u);
+
+    CHECK(memory.write32(Gpu::kGp1Address, 0x08000000u | 0x05u));
+    CHECK_EQ(system.gpu().displayWidth(), 320u);
+    CHECK_EQ(system.gpu().displayHeight(), 480u);
+
+    CHECK(memory.write32(Gpu::kGp1Address, 0x03000001u));
+    CHECK(system.gpu().displayDisabled());
+    CHECK(memory.write32(Gpu::kGp1Address, 0x03000000u));
+    CHECK(!system.gpu().displayDisabled());
+}
+
 TEST_CASE(dma_otc_builds_reverse_chain) {
     Memory memory;
     System system(memory);
@@ -390,7 +424,7 @@ TEST_CASE(spu_dma_write_and_read) {
     CHECK_EQ(system.spu().ram(0x87u), 0x55u);
 
     CHECK(memory.write16(Spu::kBaseAddress + 0x1AAu, 0x30u));
-    CHECK(memory.write16(Spu::kBaseAddress + 0x1A6u, 0));
+    CHECK(memory.write16(Spu::kBaseAddress + 0x1A6u, 0x10u));
     CHECK(memory.write32(Dma::kBaseAddress + 4u * 0x10u, 0x80003010u));
     CHECK(memory.write32(Dma::kBaseAddress + 4u * 0x10u + 4u, 0x00010002u));
     CHECK(memory.write32(Dma::kBaseAddress + 4u * 0x10u + 8u, 0x01000200u));

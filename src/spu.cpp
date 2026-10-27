@@ -1,7 +1,9 @@
 #include "psxreborn/spu.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 
 namespace psxreborn {
 
@@ -162,6 +164,9 @@ bool Spu::read16(uint32_t address, uint16_t& value) const {
         value = status();
         return true;
     }
+    if (offset == 0x1AAu && std::getenv("PSXREBORN_SPU_LOG") != nullptr) {
+        std::cerr << "[SPU] attr read 0x" << std::hex << registers_[index] << std::dec << "\n";
+    }
     value = registers_[index];
     return true;
 }
@@ -223,6 +228,9 @@ bool Spu::write16(uint32_t address, uint16_t value) {
             transferAddress_ = (transferAddress_ + 2u) & (kRamSize - 1u);
         }
     } else if (offset == 0x1AAu) {
+        if (std::getenv("PSXREBORN_SPU_LOG") != nullptr) {
+            std::cerr << "[SPU] attr write 0x" << std::hex << value << std::dec << "\n";
+        }
         control_ = value;
         if ((value & 0x40u) == 0) {
             irqFlag_ = false;

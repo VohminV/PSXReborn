@@ -1,4 +1,5 @@
 #include "psxreborn/dma.hpp"
+#include <iostream>
 
 #include "psxreborn/cdrom.hpp"
 #include "psxreborn/gpu.hpp"
@@ -283,7 +284,7 @@ bool Dma::runNormal(unsigned index) {
 }
 
 void Dma::start(unsigned index) {
-    if (!channelEnabled(index)) {
+        if (!channelEnabled(index)) {
         return;
     }
     if (index == 6) {
