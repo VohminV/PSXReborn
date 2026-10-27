@@ -37,6 +37,48 @@ Bios::Bios(Cpu& cpu, Memory& memory, System& system)
 
 Bios::~Bios() = default;
 
+void Bios::padInit(uint32_t buf1, uint32_t siz1, uint32_t buf2, uint32_t siz2) {
+    (void)siz1;
+    (void)siz2;
+    padBuf1_ = buf1;
+    padBuf2_ = buf2;
+    if (padBuf1_ != 0) {
+        for (unsigned i = 0; i < 0x22u; ++i) {
+            memory_.write8(padBuf1_ + i, 0);
+        }
+        memory_.write8(padBuf1_ + 1, 0x41);
+    }
+    if (padBuf2_ != 0) {
+        for (unsigned i = 0; i < 0x22u; ++i) {
+            memory_.write8(padBuf2_ + i, 0);
+        }
+        memory_.write8(padBuf2_ + 1, 0x41);
+    }
+}
+
+void Bios::padStart() {
+    padEnabled_ = true;
+}
+
+void Bios::padStop() {
+    padEnabled_ = false;
+}
+
+void Bios::padUpdate() {
+    if (padBuf1_ != 0) {
+        memory_.write8(padBuf1_ + 0, 0);
+        memory_.write8(padBuf1_ + 1, 0x41);
+        memory_.write8(padBuf1_ + 2, static_cast<uint8_t>(padButtons_ & 0xFFu));
+        memory_.write8(padBuf1_ + 3, static_cast<uint8_t>((padButtons_ >> 8) & 0xFFu));
+    }
+    if (padBuf2_ != 0) {
+        memory_.write8(padBuf2_ + 0, 0);
+        memory_.write8(padBuf2_ + 1, 0x41);
+        memory_.write8(padBuf2_ + 2, static_cast<uint8_t>(padButtons_ & 0xFFu));
+        memory_.write8(padBuf2_ + 3, static_cast<uint8_t>((padButtons_ >> 8) & 0xFFu));
+    }
+}
+
 void Bios::reset() {
     events_.clear();
     heap_.clear();
@@ -68,6 +110,9 @@ void Bios::install() {
 void Bios::handleVBlank() {
     deliverEventClass(kEventVBlank, kEventVBlankSpec);
     deliverEventClass(0xF0000001u, 0x0001u);
+    if (padEnabled_) {
+        padUpdate();
+    }
 }
 
 void Bios::handleCdromInterrupt(uint8_t interrupt) {
@@ -896,12 +941,34 @@ void Bios::b0Call(uint8_t function) {
             return;
         }
         case 0x12:
-        case 0x13:
-        case 0x14:
-        case 0x15:
-        case 0x16:
+            padInit(cpu_.reg(kA0), cpu_.reg(kA1), cpu_.reg(kA2), cpu_.reg(kA3));
             cpu_.setReg(kV0, 0);
             return;
+        case 0x13:
+            padStart();
+            cpu_.setReg(kV0, 0);
+            return;
+        case 0x14:
+            padStop();
+            cpu_.setReg(kV0, 0);
+            return;
+        case 0x15:
+            padInit(cpu_.reg(kA1), 0x22u, cpu_.reg(kA2), 0x22u);
+            padStart();
+            cpu_.setReg(kV0, 2);
+            return;
+        case 0x16: {
+            uint32_t buttons = padButtons_;
+            if (padBuf1_ != 0) {
+                memory_.write8(padBuf1_ + 0, 0);
+                memory_.write8(padBuf1_ + 1, 0x41);
+                memory_.write8(padBuf1_ + 2, static_cast<uint8_t>(buttons & 0xFFu));
+                memory_.write8(padBuf1_ + 3, static_cast<uint8_t>((buttons >> 8) & 0xFFu));
+            }
+            cpu_.setReg(kV0, (static_cast<uint32_t>(padButtons_ >> 8) << 0) |
+                             (static_cast<uint32_t>(padButtons_ & 0xFFu) << 8));
+            return;
+        }
         case 0x18:
         case 0x19:
             cpu_.setReg(kV0, 0);

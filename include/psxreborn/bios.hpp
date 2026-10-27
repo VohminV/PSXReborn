@@ -22,6 +22,8 @@ public:
     void reset();
     void install();
     void attachDisc(const CdImage* disc) { disc_ = disc; }
+    void setPadButtons(uint16_t buttons) { padButtons_ = buttons; }
+    uint16_t padButtons() const { return padButtons_; }
 
     void handleVBlank();
     void handleCdromInterrupt(uint8_t interrupt);
@@ -85,6 +87,11 @@ private:
     uint32_t heapRealloc(uint32_t address, uint32_t size);
     void coalesce();
 
+    void padInit(uint32_t buf1, uint32_t siz1, uint32_t buf2, uint32_t siz2);
+    void padStart();
+    void padStop();
+    void padUpdate();
+
     uint32_t fetchArgument(unsigned index, unsigned firstRegister) const;
     std::string formatString(uint32_t formatAddress, unsigned firstRegister) const;
     void print(const std::string& text);
@@ -102,6 +109,11 @@ private:
     uint32_t tableBase_ = 0;
     bool installed_ = false;
     uint32_t randState_ = 1;
+
+    uint32_t padBuf1_ = 0;
+    uint32_t padBuf2_ = 0;
+    bool padEnabled_ = false;
+    uint16_t padButtons_ = 0xFFFFu;
 };
 
 }  // namespace psxreborn
