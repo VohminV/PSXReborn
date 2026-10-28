@@ -8,10 +8,16 @@ The long-term goal is to build a reusable toolchain capable of translating PS1 g
 
 > **Project status: Early development.** The architecture, compatibility layer, and toolchain are under development. Game compatibility and performance targets have not yet been established.
 
-The current milestone implements a PS-X EXE loader, guest memory model, integer
-R3000A interpreter, and inspection/execution CLI. It does not boot a BIOS, run a
-disc, or execute commercial games yet. See [docs/architecture.md](docs/architecture.md)
-for the implemented scope and known limitations.
+The current implementation includes a PS-X EXE loader, guest memory model, an
+interpreted MIPS R3000A CPU with COP0 and GTE, BIOS HLE hooks, CD-ROM image
+access with `SYSTEM.CNF` boot parsing, interrupts, timers, DMA, partial SPU and
+SIO pad emulation, and a software GPU rasterizer with a 1024x512 VRAM. An SDL2
+frontend boots a disc image or PS-X EXE and presents the emulated display.
+
+Native code translation and the Vulkan renderer are **not implemented yet**.
+Rendering currently runs in the CPU rasterizer, and SDL2 copies VRAM into a
+texture for presentation. See [docs/architecture.md](docs/architecture.md) for
+the original milestone design.
 
 ## Goals
 
@@ -30,20 +36,21 @@ The project is intended to separate guest hardware behavior from host-specific i
 
 | Component | Responsibility |
 | --- | --- |
-| Executable Loader | Parse PS-X EXE files, disc images, and dynamically loaded modules |
-| MIPS Translator | Decode guest instructions and translate executable code |
-| Guest Runtime | Manage guest memory, exceptions, system services, and hardware interfaces |
-| PS1 GPU Model | Reproduce GPU commands, VRAM operations, texture handling, and blending semantics |
-| Vulkan Renderer | Execute rendering workloads on the host GPU |
-| Audio Runtime | Implement PlayStation sound processing and host audio output |
-| Input Backend | Handle keyboard, mouse, and gamepad input |
-| Camera Profiles | Configure game-specific mouse-to-camera or mouse-to-analog-stick mappings |
+| Executable Loader | Parse PS-X EXE files, CUE/ISO disc images, and `SYSTEM.CNF` boot paths |
+| MIPS Translator | Decode guest instructions; currently interpreted, native translation planned |
+| Guest Runtime | Guest memory, exceptions, interrupts, timers, DMA, BIOS HLE, and hardware interfaces |
+| PS1 GPU Model | Software command interpreter, 1024x512 VRAM, texture sampling, and display registers |
+| Vulkan Renderer | Planned host GPU backend; not integrated. SDL2 presents the software framebuffer today |
+| Audio Runtime | Partial SPU register, ADPCM, and DMA model; no host audio output yet |
+| Input Backend | SDL2 keyboard/gamepad mapped to the SIO pad; mouse support planned |
+| Camera Profiles | Planned game-specific mouse-to-camera mappings |
 
 The Vulkan renderer is not intended to replace the entire console architecture. CPU execution, memory behavior, synchronization, audio, and game-specific logic require separate implementations.
 
 ## Build and Test
 
-Requirements: CMake 3.20 or newer, a C++20 compiler, and Ninja.
+Requirements: CMake 3.20 or newer, a C++20 compiler, and Ninja. SDL2 is optional;
+when found, CMake also builds the `psxreborn_play` frontend.
 
 ```sh
 cmake -S . -B build -G Ninja -DPSXREBORN_BUILD_TESTS=ON
@@ -51,16 +58,31 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Inspect or execute a self-contained PS-X EXE:
+Inspect, execute, or boot:
 
 ```sh
 ./build/psxreborn inspect path/to/program.exe
 ./build/psxreborn run path/to/program.exe --max-steps 1000000
+./build/psxreborn boot path/to/disc.cue --max-steps 33868800
+./build/psxreborn_play path/to/disc.cue
 ```
 
 ## Graphics
 
-The planned Vulkan backend will investigate:
+### Current implementation
+
+The GPU is a software rasterizer writing into a 1024x512 16-bit VRAM. It handles
+fill, polygon, rectangle, and VRAM copy commands; CPU-to-VRAM and VRAM-to-CPU
+transfers; 4-bit, 8-bit, and 16-bit texture sampling; drawing area/offset and
+mask bits; and GP1 display registers.
+
+The SDL2 frontend converts VRAM to ARGB8888 and presents the current display area
+through `SDL_Renderer`. This is not a Vulkan path. Semi-transparency, dithering,
+and PlayStation display timing are not implemented.
+
+### Planned Vulkan backend
+
+The Vulkan backend will investigate:
 
 - Textured and untextured polygons.
 - Sprites and primitive ordering.
@@ -71,6 +93,17 @@ The planned Vulkan backend will investigate:
 - Synchronization between CPU-visible memory and GPU resources.
 
 Rendering accuracy and performance will be evaluated separately. Vulkan acceleration must preserve the behavior required by the game rather than merely produce visually similar output in simple scenes.
+
+## Performance
+
+The execution engine is currently an interpreter. In a Release build on the
+development machine it executed about 24 million instructions per second. A 60
+FPS PS1 frame budget is 564,480 CPU instructions, so interpreter throughput is
+the main frame-rate limit. The play loop also caps presentation at roughly
+60 FPS.
+
+Vulkan will reduce rendering and presentation overhead, but it will not remove
+the CPU-bound limit on its own; native translation is required for large gains.
 
 ## Native Code Translation
 
@@ -109,13 +142,18 @@ Camera control is game-dependent. Games without native camera control or suitabl
 - [x] PS-X EXE parser and executable inspection tools.
 - [x] Guest memory model and MIPS instruction decoder.
 - [x] Instruction-level tests and reference comparisons.
+- [x] MIPS R3000A interpreter with COP0, GTE, interrupts, timers, and DMA.
+- [x] BIOS HLE hooks, CD-ROM image access, and `SYSTEM.CNF` boot parsing.
+- [x] Software GPU command interpreter and VRAM model.
+- [x] SDL2 play frontend with keyboard and gamepad input.
 - [ ] Initial native code translation pipeline.
 - [ ] Minimal Vulkan rendering prototype.
-- [ ] PS1 GPU command processing and VRAM model.
-- [ ] Audio and controller runtime.
+- [ ] Complete PS1 GPU rendering semantics (semi-transparency, dithering, display timing).
+- [ ] Host audio output and full SPU behavior.
 - [ ] Mouse input and configurable control profiles.
-- [ ] First end-to-end game boot.
-- [ ] Windows and Linux build verification.
+- [ ] First end-to-end playable game boot.
+- [x] Linux build and automated test suite.
+- [ ] Windows build verification.
 - [ ] Compatibility testing with additional games.
 
 A roadmap item will only be marked complete after implementation and reproducible verification.
