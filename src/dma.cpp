@@ -119,6 +119,7 @@ void Dma::fail(unsigned index) {
     channels_[index].chcr &= ~(1u << 24);
     const bool previous = (dicr() & (1u << 31)) != 0;
     dicr_ |= 1u << 15;
+    ++stats_.fails[index];
     updateMasterIrq(previous);
 }
 
@@ -150,6 +151,7 @@ bool Dma::runOtc(unsigned index) {
         }
         address -= 4u;
     }
+    stats_.words[index] += words;
     channel.madr = address;
     complete(index);
     return true;
@@ -180,6 +182,7 @@ bool Dma::runGpu(unsigned index, uint32_t address, uint32_t words, bool linked) 
         }
         current += decrement ? 0xFFFFFFFCu : 4u;
     }
+    stats_.words[index] += words;
     if (!linked) {
         channel.madr = current & 0x00FFFFFFu;
         complete(index);
@@ -252,6 +255,7 @@ bool Dma::runNormal(unsigned index) {
             }
             current += decrement ? 0xFFFFFFFCu : 4u;
         }
+        stats_.words[index] += words;
         channel.madr = current & 0x00FFFFFFu;
         complete(index);
         return true;
@@ -275,6 +279,7 @@ bool Dma::runNormal(unsigned index) {
             }
             current += decrement ? 0xFFFFFFFCu : 4u;
         }
+        stats_.words[index] += words;
         channel.madr = current & 0x00FFFFFFu;
         complete(index);
         return true;
@@ -287,6 +292,7 @@ void Dma::start(unsigned index) {
         if (!channelEnabled(index)) {
         return;
     }
+    ++stats_.starts[index];
     if (index == 6) {
         runOtc(index);
         return;

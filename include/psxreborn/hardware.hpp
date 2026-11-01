@@ -7,10 +7,17 @@
 #include "psxreborn/cdrom.hpp"
 #include "psxreborn/dma.hpp"
 #include "psxreborn/gpu.hpp"
+#include "psxreborn/input_trace.hpp"
 #include "psxreborn/spu.hpp"
 #include "psxreborn/io.hpp"
+#include "psxreborn/memcard.hpp"
+#include "psxreborn/sio0.hpp"
 
 namespace psxreborn {
+
+struct InterruptStats {
+    std::array<uint64_t, 11> requests{};
+};
 
 class Cpu;
 class Memory;
@@ -33,11 +40,19 @@ public:
     static constexpr uint32_t kMaskAddress = 0x1F801074u;
 
     void reset();
-    void request(uint32_t bits) { status_ |= bits & 0x7FFu; }
+    void request(uint32_t bits) {
+        status_ |= bits & 0x7FFu;
+        for (uint32_t bit = 0; bit < 11; ++bit) {
+            if ((bits & (1u << bit)) != 0) {
+                ++stats_.requests[bit];
+            }
+        }
+    }
     void clear(uint32_t bits) { status_ &= ~(bits & 0x7FFu); }
     bool pending() const { return (status_ & mask_ & 0x7FFu) != 0; }
     uint32_t status() const { return status_; }
     uint32_t mask() const { return mask_; }
+    const InterruptStats& stats() const { return stats_; }
 
     bool read32(uint32_t address, uint32_t& value) const;
     bool write32(uint32_t address, uint32_t value);
@@ -45,6 +60,7 @@ public:
 private:
     uint32_t status_ = 0;
     uint32_t mask_ = 0;
+    InterruptStats stats_{};
 };
 
 class Timers {
@@ -109,10 +125,50 @@ public:
     const Spu& spu() const { return spu_; }
     Cdrom& cdrom() { return cdrom_; }
     const Cdrom& cdrom() const { return cdrom_; }
+    Sio0& sio0() { return sio0_; }
+    const Sio0& sio0() const { return sio0_; }
+    void setMemoryCard(unsigned slot, MemoryCard* card) {
+        if (slot < 2) {
+            cards_[slot] = card;
+            sio0_.setMemoryCard(slot, card);
+        }
+    }
+    MemoryCard* memoryCard(unsigned slot) {
+        return slot < 2 ? cards_[slot] : nullptr;
+    }
+    const MemoryCard* memoryCard(unsigned slot) const {
+        return slot < 2 ? cards_[slot] : nullptr;
+    }
+    void saveDirtyMemoryCards();
     void setVBlankHandler(std::function<void()> handler) { vblankHandler_ = std::move(handler); }
     void setIrqHandler(std::function<void()> handler) { irqHandler_ = std::move(handler); }
-    void setPadButtons(uint16_t buttons) { padButtons_ = buttons; }
+    void setPadButtons(uint16_t buttons) {
+        padButtons_ = buttons;
+        sio0_.setPadButtons(buttons);
+        inputtrace::notePush(buttons);
+    }
+    // Samples the configured PadSource (if any) into the system-visible pad
+    // state. Called before BIOS pad services read the state so guest code
+    // polling through the BIOS sees fresh input at vblank cadence.
+    void refreshPadFromSource() {
+        PadSource* source = sio0_.padSource();
+        if (source == nullptr) {
+            return;
+        }
+        const PadSnapshot snapshot = source->sample();
+        padButtons_ = snapshot.buttons;
+        sio0_.setPadButtons(snapshot.buttons);
+        sio0_.setPadSticks(snapshot.leftX, snapshot.leftY, snapshot.rightX, snapshot.rightY);
+    }
+    void setPadSticks(uint8_t leftX, uint8_t leftY, uint8_t rightX, uint8_t rightY) {
+        sio0_.setPadSticks(leftX, leftY, rightX, rightY);
+    }
+    uint8_t padLeftX() const { return sio0_.padLeftX(); }
+    uint8_t padLeftY() const { return sio0_.padLeftY(); }
+    uint8_t padRightX() const { return sio0_.padRightX(); }
+    uint8_t padRightY() const { return sio0_.padRightY(); }
     uint16_t padButtons() const { return padButtons_; }
+    uint64_t vblankFrames() const { return vblankFrames_; }
 
 private:
     static constexpr uint32_t kMiscBase = 0x1F801000u;
@@ -129,15 +185,15 @@ private:
     Spu spu_;
     Dma dma_;
     Cdrom cdrom_;
+    Sio0 sio0_;
+    std::array<MemoryCard*, 2> cards_{};
     std::array<uint8_t, kMiscSize> misc_{};
     std::function<void()> vblankHandler_;
     std::function<void()> irqHandler_;
     uint32_t vblankCycles_ = 0;
     uint32_t hblankCycles_ = 0;
-    uint8_t sioState_ = 0;
+    uint64_t vblankFrames_ = 0;
     uint16_t padButtons_ = 0xFFFFu;
-    uint8_t sioReadIndex_ = 0;
-    uint16_t sioButtons_ = 0xFFFFu;
 };
 
 }  // namespace psxreborn

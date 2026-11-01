@@ -12,6 +12,12 @@ class Gpu;
 class Interrupts;
 class Spu;
 
+struct DmaStats {
+    std::array<uint64_t, 7> starts{};
+    std::array<uint64_t, 7> words{};
+    std::array<uint64_t, 7> fails{};
+};
+
 class Dma {
 public:
     static constexpr uint32_t kBaseAddress = 0x1F801080u;
@@ -37,6 +43,7 @@ public:
     uint32_t dpcr() const { return dpcr_; }
     uint32_t dicr() const;
     bool busy(unsigned index) const { return (channels_[index].chcr & (1u << 24)) != 0; }
+    const DmaStats& stats() const { return stats_; }
 
 private:
     static bool channelRegister(uint32_t address, unsigned& index, uint32_t& offset);
@@ -59,6 +66,7 @@ private:
     std::array<Channel, kChannelCount> channels_{};
     uint32_t dpcr_ = 0x07654321u;
     uint32_t dicr_ = 0;
+    DmaStats stats_{};
 };
 
 }  // namespace psxreborn

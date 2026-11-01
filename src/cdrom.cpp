@@ -44,19 +44,21 @@ uint32_t readLe32(const uint8_t* data) {
 }
 
 std::string resolveCaseInsensitive(const std::string& path) {
-    std::error_code error;
-    if (std::filesystem::exists(path, error)) {
+    std::error_code existsError;
+    if (std::filesystem::exists(path, existsError)) {
         return path;
     }
     const std::filesystem::path requested(path);
     const std::filesystem::path directory = requested.parent_path();
     const std::string filename = requested.filename().string();
+    std::error_code error;
     if (directory.empty() || !std::filesystem::is_directory(directory, error)) {
         return path;
     }
     for (const std::filesystem::directory_entry& entry :
          std::filesystem::directory_iterator(directory, error)) {
-        if (!entry.is_regular_file(error)) {
+        std::error_code entryError;
+        if (!entry.is_regular_file(entryError)) {
             continue;
         }
         if (lower(entry.path().filename().string()) == lower(filename)) {
@@ -66,69 +68,134 @@ std::string resolveCaseInsensitive(const std::string& path) {
     return path;
 }
 
-bool parseCueFile(const std::string& cuePath, std::string& binPath, std::string& error) {
-    std::ifstream cue(cuePath, std::ios::binary);
-    if (!cue) {
-        error = "cannot open cue file";
+// Splits a CUE line into upper-case keyword + remainder, honouring ASCII only.
+bool cueKeyword(const std::string& line, std::string& keyword, std::string& rest) {
+    std::string normalized;
+    size_t begin = 0;
+    while (begin < line.size() && (line[begin] == ' ' || line[begin] == '\t')) {
+        ++begin;
+    }
+    size_t end = begin;
+    while (end < line.size() && std::isgraph(static_cast<unsigned char>(line[end])) != 0) {
+        ++end;
+    }
+    keyword = lower(line.substr(begin, end - begin));
+    rest = end < line.size() ? line.substr(end) : "";
+    rest = trim(rest);
+    return !keyword.empty();
+}
+
+// Extracts the first token (either quoted string or bare word) from a line.
+std::string cueToken(const std::string& line, size_t& position) {
+    while (position < line.size() && (line[position] == ' ' || line[position] == '\t')) {
+        ++position;
+    }
+    std::string token;
+    if (position < line.size() && line[position] == '"') {
+        ++position;
+        while (position < line.size() && line[position] != '"') {
+            token.push_back(line[position++]);
+        }
+        if (position < line.size() && line[position] == '"') {
+            ++position;
+        }
+    } else {
+        while (position < line.size() && (line[position] == ' ' || line[position] == '\t') == false) {
+            token.push_back(line[position++]);
+        }
+    }
+    return token;
+}
+
+bool parseMsfFrames(const std::string& value, uint32_t& frames, std::string& error) {
+    const int minute = std::atoi(value.substr(0, 2).c_str());
+    const int second = std::atoi(value.substr(3, 2).c_str());
+    const int frame = std::atoi(value.substr(6, 2).c_str());
+    if (value.size() != 8 || value[2] != ':' || value[5] != ':' || frame >= 75 ||
+        minute > 99 || second > 59) {
+        error = "cue: invalid mm:ss:ff value '" + value + "'";
         return false;
     }
-    std::string line;
-    while (std::getline(cue, line)) {
-        const std::string normalized = trim(line);
-        if (normalized.size() < 4) {
-            continue;
-        }
-        if (lower(normalized.substr(0, 4)) != "file") {
-            continue;
-        }
-        size_t index = 4;
-        while (index < normalized.size() && std::isspace(static_cast<unsigned char>(normalized[index])) != 0) {
-            ++index;
-        }
-        std::string name;
-        if (index < normalized.size() && normalized[index] == '"') {
-            ++index;
-            while (index < normalized.size() && normalized[index] != '"') {
-                name.push_back(normalized[index++]);
-            }
-        } else {
-            while (index < normalized.size() && std::isspace(static_cast<unsigned char>(normalized[index])) == 0) {
-                name.push_back(normalized[index++]);
-            }
-        }
-        if (name.empty()) {
-            continue;
-        }
-        const size_t slash = cuePath.find_last_of("/\\");
-        if (slash != std::string::npos && name.find_first_of("/\\") == std::string::npos) {
-            name = cuePath.substr(0, slash + 1) + name;
-        }
-        binPath = name;
+    frames = static_cast<uint32_t>(minute * 60 * 75) + static_cast<uint32_t>(second * 75) +
+             static_cast<uint32_t>(frame);
+    return true;
+}
+
+// Sector layout for a CUE TRACK type, matching the raw byte stream inside the
+// referenced file.
+bool trackLayout(const std::string& type, uint32_t& sectorSize, uint32_t& dataOffset,
+                 uint32_t& dataSize, bool& audio, std::string& error) {
+    audio = false;
+    if (type == "AUDIO") {
+        sectorSize = 2352;
+        dataOffset = 0;
+        dataSize = 2352;
+        audio = true;
         return true;
     }
-    error = "cue file has no FILE entry";
+    if (type == "MODE1/2048") {
+        sectorSize = 2048;
+        dataOffset = 0;
+        dataSize = 2048;
+        return true;
+    }
+    if (type == "MODE1/2352") {
+        sectorSize = 2352;
+        dataOffset = 16;
+        dataSize = 2048;
+        return true;
+    }
+    if (type == "MODE2/2352") {
+        sectorSize = 2352;
+        dataOffset = 24;
+        dataSize = 2048;
+        return true;
+    }
+    if (type == "MODE2/2336") {
+        sectorSize = 2336;
+        dataOffset = 8;
+        dataSize = 2048;
+        return true;
+    }
+    error = "cue: unsupported TRACK type '" + type + "'";
     return false;
 }
 
 }  // namespace
 
 std::optional<CdImage> CdImage::open(const std::string& path, std::string& error) {
-    std::string imagePath = path;
+    CdImage image;
     const std::string extension = lower(std::filesystem::path(path).extension().string());
     if (extension == ".cue") {
-        if (!parseCueFile(path, imagePath, error)) {
+        std::string cueDirectory;
+        const size_t slash = path.find_last_of("/\\");
+        if (slash != std::string::npos) {
+            cueDirectory = path.substr(0, slash + 1);
+        }
+        if (!image.initializeCue(path, cueDirectory, image.files_, error)) {
             return std::nullopt;
         }
+        return image;
     }
 
-    CdImage image;
-    imagePath = resolveCaseInsensitive(imagePath);
-    image.stream_.open(imagePath, std::ios::binary);
-    if (!image.stream_) {
+    const std::string imagePath = resolveCaseInsensitive(path);
+    image.files_.emplace_back();
+    MediaFile& file = image.files_.back();
+    file.path = imagePath;
+    file.stream = std::make_unique<std::ifstream>(imagePath, std::ios::binary);
+    if (!file.stream || !file.stream->is_open()) {
         error = "cannot open disc image: " + imagePath;
         return std::nullopt;
     }
-    if (!image.initialize(error)) {
+    file.stream->seekg(0, std::ios::end);
+    if (!file.stream) {
+        error = "cannot determine disc image size";
+        return std::nullopt;
+    }
+    file.size = static_cast<uint64_t>(file.stream->tellg());
+    file.stream->clear();
+    file.stream->seekg(0, std::ios::beg);
+    if (!image.buildFallbackTimeline(error)) {
         return std::nullopt;
     }
     return image;
@@ -136,47 +203,47 @@ std::optional<CdImage> CdImage::open(const std::string& path, std::string& error
 
 std::optional<CdImage> CdImage::fromBytes(std::vector<uint8_t> bytes, std::string& error) {
     CdImage image;
-    image.buffer_ = std::move(bytes);
-    if (!image.initialize(error)) {
+    if (bytes.empty()) {
+        error = "disc image buffer is empty";
+        return std::nullopt;
+    }
+    image.files_.emplace_back();
+    MediaFile& file = image.files_.back();
+    file.inlineBuffer = std::move(bytes);
+    file.size = file.inlineBuffer.size();
+    if (!image.buildFallbackTimeline(error)) {
         return std::nullopt;
     }
     return image;
 }
 
-bool CdImage::readAt(uint64_t offset, uint8_t* destination, size_t size) const {
+bool CdImage::readAt(const MediaFile& file, uint64_t offset, uint8_t* destination,
+                     size_t size) const {
     if (size == 0) {
         return true;
     }
-    if (!buffer_.empty()) {
-        if (offset + size > buffer_.size()) {
+    if (!file.inlineBuffer.empty()) {
+        if (offset + size > file.inlineBuffer.size()) {
             return false;
         }
-        std::memcpy(destination, buffer_.data() + offset, size);
+        std::memcpy(destination, file.inlineBuffer.data() + offset, size);
         return true;
     }
-    stream_.clear();
-    stream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    if (!stream_) {
+    if (!file.stream) {
         return false;
     }
-    stream_.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(size));
-    return static_cast<size_t>(stream_.gcount()) == size;
+    file.stream->clear();
+    file.stream->seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!file.stream) {
+        return false;
+    }
+    file.stream->read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(size));
+    return static_cast<size_t>(file.stream->gcount()) == size;
 }
 
-bool CdImage::initialize(std::string& error) {
-    uint64_t totalSize = 0;
-    if (!buffer_.empty()) {
-        totalSize = buffer_.size();
-    } else {
-        stream_.seekg(0, std::ios::end);
-        if (!stream_) {
-            error = "cannot determine disc image size";
-            return false;
-        }
-        totalSize = static_cast<uint64_t>(stream_.tellg());
-        stream_.seekg(0, std::ios::beg);
-    }
-
+bool CdImage::detectSingleFileLayout(const MediaFile& file, uint32_t& sectorSize,
+                                     uint32_t& dataOffset, uint32_t& dataSize) {
+    const uint64_t totalSize = file.size;
     struct Layout {
         uint32_t sectorSize;
         uint32_t dataOffset;
@@ -193,8 +260,8 @@ bool CdImage::initialize(std::string& error) {
             continue;
         }
         std::array<uint8_t, 2048> sector{};
-        if (!readAt(static_cast<uint64_t>(16u) * layout.sectorSize + layout.dataOffset, sector.data(),
-                    sector.size())) {
+        if (!readAt(file, static_cast<uint64_t>(16u) * layout.sectorSize + layout.dataOffset,
+                    sector.data(), sector.size())) {
             continue;
         }
         if (sector[1] != 'C' || sector[2] != 'D' || sector[3] != '0' || sector[4] != '0' ||
@@ -204,35 +271,343 @@ bool CdImage::initialize(std::string& error) {
         if (totalSize % layout.sectorSize != 0) {
             continue;
         }
-        sectorSize_ = layout.sectorSize;
-        dataOffset_ = layout.dataOffset;
-        dataSize_ = layout.dataSize;
-        sectorCount_ = static_cast<uint32_t>(totalSize / layout.sectorSize);
+        sectorSize = layout.sectorSize;
+        dataOffset = layout.dataOffset;
+        dataSize = layout.dataSize;
         return true;
     }
-
-    error = "disc image is not a recognizable ISO9660 image";
     return false;
+}
+
+// Single plain image (raw bin/iso file with no cue sheet): auto-probe the
+// sector layout and build a one-track timeline covering the entire file.
+bool CdImage::buildFallbackTimeline(std::string& error) {
+    MediaFile& file = files_.back();
+    uint32_t sectorSize = 0;
+    uint32_t dataOffset = 0;
+    uint32_t dataSize = 0;
+    if (!detectSingleFileLayout(file, sectorSize, dataOffset, dataSize)) {
+        error = "disc image is not a recognizable ISO9660 image";
+        return false;
+    }
+    file.sectorSize = sectorSize;
+    file.dataOffset = dataOffset;
+    file.dataSize = dataSize;
+    const uint32_t sectors = static_cast<uint32_t>(file.size / sectorSize);
+    regions_.push_back({CdRegion::Type::Data, false, 0, sectors, 0, 0, 1});
+    CdTrack track;
+    track.number = 1;
+    track.audio = false;
+    track.index00Lba = 0;
+    track.startLba = 0;
+    track.endLba = sectors;
+    tracks_.push_back(track);
+    sectorCount_ = sectors;
+    return true;
+}
+
+bool CdImage::initializeCue(const std::string& cuePath, const std::string& cueDirectory,
+                            std::vector<MediaFile>& files, std::string& error) {
+    std::ifstream cue(cuePath, std::ios::binary);
+    if (!cue) {
+        error = "cannot open cue file: " + cuePath;
+        return false;
+    }
+
+    // Phase 1: parse the cue sheet into a flat track list. Positions in
+    // INDEX/PREGAP commands are offsets within the referenced file, measured
+    // in frames (sectors); PREGAP sectors are virtual silence that only exist
+    // on the disc timeline, while INDEX 00 sectors are stored in the file.
+    struct TrackRecord {
+        uint32_t number = 0;
+        uint32_t fileIndex = 0;
+        bool audio = false;
+        bool hasIndex00 = false;
+        uint32_t index00Frames = 0;
+        uint32_t index01Frames = 0;
+        uint32_t pregapFrames = 0;
+    };
+
+    std::vector<TrackRecord> records;
+    TrackRecord current{};
+    bool currentValid = false;
+    int32_t currentFileIndex = -1;
+    MediaFile* currentFile = nullptr;
+    uint32_t fileLayoutSize = 0;
+
+    auto openCueFile = [&](const std::string& reference) -> bool {
+        std::string imagePath = reference;
+        const size_t slash = imagePath.find_last_of("/\\");
+        if (slash == std::string::npos) {
+            imagePath = cueDirectory + imagePath;
+        }
+        imagePath = resolveCaseInsensitive(imagePath);
+        MediaFile file;
+        file.path = imagePath;
+        file.stream = std::make_unique<std::ifstream>(imagePath, std::ios::binary);
+        if (!file.stream || !file.stream->is_open()) {
+            error = "cue: cannot open file: " + imagePath;
+            return false;
+        }
+        file.stream->seekg(0, std::ios::end);
+        if (!file.stream) {
+            error = "cue: cannot determine file size: " + imagePath;
+            return false;
+        }
+        file.size = static_cast<uint64_t>(file.stream->tellg());
+        file.stream->clear();
+        file.stream->seekg(0, std::ios::beg);
+        files.push_back(std::move(file));
+        currentFileIndex = static_cast<int32_t>(files.size() - 1);
+        currentFile = &files.back();
+        fileLayoutSize = 0;
+        return true;
+    };
+
+    uint32_t sectorSize = 0;
+    uint32_t dataOffset = 0;
+    uint32_t dataSize = 0;
+    bool audio = false;
+
+    std::string line;
+    while (std::getline(cue, line)) {
+        std::string keyword;
+        std::string rest;
+        if (!cueKeyword(line, keyword, rest)) {
+            continue;
+        }
+        if (keyword == "file") {
+            size_t position = 0;
+            const std::string reference = cueToken(rest, position);
+            if (reference.empty()) {
+                error = "cue: FILE without file name";
+                return false;
+            }
+            if (currentValid) {
+                records.push_back(current);
+                currentValid = false;
+            }
+            if (!openCueFile(reference)) {
+                return false;
+            }
+            continue;
+        }
+        if (keyword == "track") {
+            if (currentValid) {
+                records.push_back(current);
+                currentValid = false;
+            }
+            size_t position = 0;
+            const std::string numberText = cueToken(rest, position);
+            if (numberText.empty()) {
+                error = "cue: TRACK without track number";
+                return false;
+            }
+            const uint32_t number = static_cast<uint32_t>(std::atoi(numberText.c_str()));
+            if (number == 0 || number > 99) {
+                error = "cue: invalid track number '" + numberText + "'";
+                return false;
+            }
+            const std::string trackType = cueToken(rest, position);
+            if (trackType.empty()) {
+                error = "cue: TRACK without track type";
+                return false;
+            }
+            if (!trackLayout(trackType, sectorSize, dataOffset, dataSize, audio, error)) {
+                return false;
+            }
+            if (currentFile == nullptr) {
+                error = "cue: TRACK without preceding FILE";
+                return false;
+            }
+            if (fileLayoutSize == 0) {
+                currentFile->sectorSize = sectorSize;
+                currentFile->dataOffset = dataOffset;
+                currentFile->dataSize = dataSize;
+                fileLayoutSize = sectorSize;
+            } else if (fileLayoutSize != sectorSize) {
+                error = "cue: TRACK types with differing sector sizes share one FILE";
+                return false;
+            }
+            current = TrackRecord{};
+            current.number = number;
+            current.fileIndex = static_cast<uint32_t>(currentFileIndex);
+            current.audio = audio;
+            currentValid = true;
+            continue;
+        }
+        if (keyword == "pregap" || keyword == "postgap") {
+            uint32_t frames = 0;
+            if (!parseMsfFrames(rest, frames, error)) {
+                return false;
+            }
+            if (!currentValid) {
+                error = std::string("cue: ") + (keyword == "pregap" ? "PREGAP" : "POSTGAP") +
+                        " outside TRACK";
+                return false;
+            }
+            // POSTGAP and PREGAP both occupy the same virtual gap slot in the
+            // track record: real cue sheets use at most one of them per track.
+            current.pregapFrames += frames;
+            continue;
+        }
+        if (keyword == "index") {
+            size_t position = 0;
+            const std::string numberText = cueToken(rest, position);
+            const std::string msfValue = trim(rest.substr(position));
+            uint32_t frames = 0;
+            if (!parseMsfFrames(msfValue, frames, error)) {
+                return false;
+            }
+            if (!currentValid) {
+                error = "cue: INDEX outside TRACK";
+                return false;
+            }
+            const uint32_t indexNumber = static_cast<uint32_t>(std::atoi(numberText.c_str()));
+            if (indexNumber == 0) {
+                current.index00Frames = frames;
+                current.hasIndex00 = true;
+            } else if (indexNumber == 1) {
+                current.index01Frames = frames;
+            }
+            continue;
+        }
+        // Remaining cue commands (CATALOG, CDTEXTFILE, REM, FLAGS, ...) do not
+        // affect the sector mapping.
+    }
+    if (currentValid) {
+        records.push_back(current);
+    }
+    if (records.empty()) {
+        error = "cue: no TRACK entries";
+        return false;
+    }
+
+    // Phase 2: allocate the disc timeline in track order. Every track owns:
+    //   virtual pregap silence, then (optionally) INDEX 00 sectors from the
+    //   file, then data/audio sectors from INDEX 01 up to the start of the
+    //   next track (or the end of the file).
+    uint32_t absolute = 0;
+    for (size_t index = 0; index < records.size(); ++index) {
+        const TrackRecord& track = records[index];
+        const MediaFile& file = files_[track.fileIndex];
+        const uint32_t fileSectors = static_cast<uint32_t>(file.size / file.sectorSize);
+
+        // Determine the file position where this track's owned sectors end.
+        uint32_t endPos = fileSectors;
+        if (index + 1 < records.size() && records[index + 1].fileIndex == track.fileIndex) {
+            const TrackRecord& next = records[index + 1];
+            endPos = next.hasIndex00 ? next.index00Frames : next.index01Frames;
+        }
+        const uint32_t firstPos = track.hasIndex00 ? track.index00Frames : track.index01Frames;
+        if (firstPos >= fileSectors || endPos > fileSectors || endPos <= firstPos) {
+            error = "cue: track " + std::to_string(track.number) +
+                    " positions fall outside the file";
+            return false;
+        }
+
+        if (track.pregapFrames != 0) {
+            regions_.push_back({CdRegion::Type::Silence, true, absolute, track.pregapFrames,
+                                CdRegion::kNoFile, 0, static_cast<uint8_t>(track.number)});
+            absolute += track.pregapFrames;
+        }
+
+        CdTrack built;
+        built.number = static_cast<uint8_t>(track.number);
+        built.audio = track.audio;
+
+        if (track.hasIndex00 && track.index00Frames < track.index01Frames) {
+            const uint32_t count = track.index01Frames - track.index00Frames;
+            regions_.push_back({track.audio ? CdRegion::Type::Audio : CdRegion::Type::Data, true,
+                                absolute, count, static_cast<uint16_t>(track.fileIndex),
+                                track.index00Frames, static_cast<uint8_t>(track.number)});
+            built.index00Lba = absolute;
+            absolute += count;
+        } else {
+            built.index00Lba = absolute;
+        }
+
+        built.startLba = absolute;
+        const uint32_t dataCount = endPos - track.index01Frames;
+        if (dataCount != 0) {
+            regions_.push_back({track.audio ? CdRegion::Type::Audio : CdRegion::Type::Data, false,
+                                absolute, dataCount, static_cast<uint16_t>(track.fileIndex),
+                                track.index01Frames, static_cast<uint8_t>(track.number)});
+            absolute += dataCount;
+        }
+        built.endLba = absolute;
+        tracks_.push_back(built);
+    }
+
+    if (regions_.empty() || tracks_.empty()) {
+        error = "cue: internal error: empty timeline";
+        return false;
+    }
+
+    sectorCount_ = absolute;
+    return true;
+}
+
+const CdRegion* CdImage::regionAt(uint32_t lba) const {
+    auto it = std::upper_bound(regions_.begin(), regions_.end(), lba,
+                               [](uint32_t value, const CdRegion& region) {
+                                   return value < region.startLba;
+                               });
+    if (it == regions_.begin()) {
+        return nullptr;
+    }
+    --it;
+    if (lba >= it->startLba + it->sectors) {
+        return nullptr;
+    }
+    return &*it;
 }
 
 bool CdImage::readRawSector(uint32_t lba, uint8_t* destination, size_t size) const {
     if (!valid() || lba >= sectorCount_ || destination == nullptr) {
         return false;
     }
-    const uint64_t offset = static_cast<uint64_t>(lba) * sectorSize_;
+    const CdRegion* region = regionAt(lba);
+    if (region == nullptr) {
+        return false;
+    }
     std::memset(destination, 0, size);
-    const size_t available = std::min<size_t>(size, sectorSize_);
-    return readAt(offset, destination, available);
+    if (region->fileIndex == CdRegion::kNoFile) {
+        // Virtual silence (pregap/postgap): no bytes are stored in the files.
+        return true;
+    }
+    const MediaFile& file = files_[region->fileIndex];
+    const uint32_t regionIntraLba = lba - region->startLba;
+    const uint64_t fileSector = region->fileStartSector + regionIntraLba;
+    const uint64_t offset = fileSector * file.sectorSize;
+    const size_t available = std::min<size_t>(size, file.sectorSize);
+    return readAt(file, offset, destination, available);
 }
 
 bool CdImage::readUserSector(uint32_t lba, uint8_t* destination, size_t size) const {
     if (!valid() || lba >= sectorCount_ || destination == nullptr) {
         return false;
     }
-    const uint64_t offset = static_cast<uint64_t>(lba) * sectorSize_ + dataOffset_;
+    const CdRegion* region = regionAt(lba);
+    if (region == nullptr) {
+        return false;
+    }
     std::memset(destination, 0, size);
-    const size_t available = std::min<size_t>(size, dataSize_);
-    return readAt(offset, destination, available);
+    if (region->fileIndex == CdRegion::kNoFile) {
+        // Virtual silence (pregap/postgap): no bytes are stored in the files.
+        return true;
+    }
+    if (region->type == CdRegion::Type::Audio) {
+        // Audio sectors have no 2048-byte user-data payload; caller must use
+        // raw reads to fetch PCM data.
+        return false;
+    }
+    const MediaFile& file = files_[region->fileIndex];
+    const uint32_t regionIntraLba = lba - region->startLba;
+    const uint64_t fileSector = region->fileStartSector + regionIntraLba;
+    const uint64_t offset = fileSector * file.sectorSize + file.dataOffset;
+    const size_t available = std::min<size_t>(size, file.dataSize);
+    return readAt(file, offset, destination, available);
 }
 
 bool CdImage::readSectorData(uint32_t lba, std::array<uint8_t, kDataSectorSize>& data) const {
@@ -462,6 +837,7 @@ void Cdrom::reset() {
     currentLba_ = 0;
     seekLba_ = 150;
     readCycles_ = 0;
+    playCycles_ = 0;
     cyclesPerSector_ = 33868800u / 75u;
     parameterCount_ = 0;
     response_.clear();
@@ -680,10 +1056,12 @@ void Cdrom::scheduleSecondResponse(uint8_t interrupt, uint32_t cycles,
 }
 
 void Cdrom::setError(uint8_t code) {
+    ++stats_.failures;
     pushResponse(0x05u, {statusByte(), code});
 }
 
 void Cdrom::executeCommand(uint8_t command) {
+    ++stats_.commands;
     if (cdTrace()) {
         std::cerr << "[CD] cmd " << std::hex << static_cast<unsigned>(command) << std::dec
                   << " params=" << parameterCount_;
@@ -759,6 +1137,7 @@ void Cdrom::executeCommand(uint8_t command) {
         case 0x0C:  // Demute
         case 0x0D:  // SetFilter
             pushResponse(0x03u, {statusByte()});
+            scheduleSecondResponse(0x02u, 50000u, {statusByte()});
             break;
         case 0x0E:  // SetMode
             if (parameterCount_ >= 1) {
@@ -777,23 +1156,84 @@ void Cdrom::executeCommand(uint8_t command) {
             break;
         }
         case 0x11: {  // GetLocP
-            const uint32_t lba = currentLba_ + 150u;
-            const uint8_t minute = toBcd(static_cast<uint8_t>(lba / (60u * 75u)));
-            const uint8_t second = toBcd(static_cast<uint8_t>((lba / 75u) % 60u));
-            const uint8_t frame = toBcd(static_cast<uint8_t>(lba % 75u));
-            pushResponse(0x03u, {0x01, 0x01, minute, second, frame, minute, second, frame});
+            uint8_t trackNumber = 0xAA;
+            uint8_t index = 0x01;
+            uint32_t relBase = disc_ != nullptr ? disc_->sectorCount() : 0;
+            if (disc_ != nullptr && disc_->valid()) {
+                const CdRegion* region = disc_->regionAt(currentLba_);
+                if (region == nullptr) {
+                    // Lead-in area before the first data sector.
+                    relBase = 0;
+                    trackNumber = 0x00;
+                } else {
+                    trackNumber = region->trackNumber;
+                    index = region->index00 ? 0x00 : 0x01;
+                    relBase = region->startLba;
+                    if (!region->index00) {
+                        for (const CdTrack& track : disc_->tracks()) {
+                            if (track.number == trackNumber) {
+                                relBase = track.startLba;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            const uint32_t relative = currentLba_ - relBase;
+            const uint32_t absoluteFrames = currentLba_ + 150u;
+            const uint8_t relMinute = toBcd(static_cast<uint8_t>((relative / 75u) / 60u));
+            const uint8_t relSecond = toBcd(static_cast<uint8_t>((relative / 75u) % 60u));
+            const uint8_t relFrame = toBcd(static_cast<uint8_t>(relative % 75u));
+            const uint8_t absMinute = toBcd(static_cast<uint8_t>((absoluteFrames / 75u) / 60u));
+            const uint8_t absSecond = toBcd(static_cast<uint8_t>((absoluteFrames / 75u) % 60u));
+            const uint8_t absFrame = toBcd(static_cast<uint8_t>(absoluteFrames % 75u));
+            pushResponse(0x03u, {trackNumber, index, relMinute, relSecond, relFrame, absMinute,
+                                 absSecond, absFrame});
             break;
         }
         case 0x12:  // SetSession
             pushResponse(0x03u, {statusByte()});
             scheduleSecondResponse(0x02u, 50000u, {statusByte()});
             break;
-        case 0x13:  // GetTN
-            pushResponse(0x03u, {statusByte(), 0x01, 0x01});
+        case 0x13: {  // GetTN
+            uint8_t first = 0x01;
+            uint8_t last = 0x01;
+            if (disc_ != nullptr && !disc_->tracks().empty()) {
+                first = toBcd(disc_->tracks().front().number);
+                last = toBcd(disc_->tracks().back().number);
+            }
+            pushResponse(0x03u, {statusByte(), first, last});
             break;
-        case 0x14:  // GetTD
-            pushResponse(0x03u, {statusByte(), toBcd(74), toBcd(0)});
+        }
+        case 0x14: {  // GetTD
+            bool ok = false;
+            uint32_t startLba = 0;
+            if (parameterCount_ >= 1) {
+                const uint8_t track = fromBcd(parameter_[0]);
+                if (disc_ != nullptr) {
+                    for (const CdTrack& entry : disc_->tracks()) {
+                        if (entry.number == track) {
+                            startLba = entry.startLba;
+                            ok = true;
+                            break;
+                        }
+                    }
+                }
+                if (track == 0xA9 || track == 0xAA) {
+                    // Lead-out: report the end of the last track.
+                    startLba = disc_ != nullptr ? disc_->sectorCount() : 0;
+                    ok = true;
+                }
+            }
+            if (!ok) {
+                setError(0x10);
+                break;
+            }
+            const uint32_t absolute = startLba + 150u;
+            pushResponse(0x03u, {statusByte(), toBcd(static_cast<uint8_t>(((absolute / 75u) / 60u) % 100u)),
+                                 toBcd(static_cast<uint8_t>((absolute / 75u) % 60u))});
             break;
+        }
         case 0x15:  // SeekL
         case 0x16:  // SeekP
             motorOn_ = true;
@@ -819,6 +1259,7 @@ void Cdrom::executeCommand(uint8_t command) {
             scheduleSecondResponse(0x02u, 50000u, {statusByte()});
             break;
         default:
+            ++stats_.unknownCommands;
             setError(0x40);
             break;
     }
@@ -837,6 +1278,21 @@ void Cdrom::tick(uint32_t cycles) {
             secondResponseCycles_ -= cycles;
         }
     }
+    if (state_ == State::Playing) {
+        // CDDA playback: the drive advances through audio sectors. Output of
+        // the decoded samples into the SPU/digital audio path is not
+        // implemented; position reporting (GetLocP) still reflects playback.
+        playCycles_ += cycles;
+        while (playCycles_ >= cyclesPerSector_) {
+            playCycles_ -= cyclesPerSector_;
+            ++currentLba_;
+            if (disc_ == nullptr || currentLba_ >= disc_->sectorCount()) {
+                state_ = State::Idle;
+                break;
+            }
+        }
+        return;
+    }
     if (state_ != State::Reading) {
         return;
     }
@@ -854,27 +1310,40 @@ void Cdrom::prepareSector() {
         state_ = State::Idle;
         return;
     }
-    if ((mode_ & 0x20u) != 0) {
-        if (!disc_->readRawSector(currentLba_, sector_.data(), sector_.size())) {
-            setError(0x04);
-            state_ = State::Idle;
-            return;
+    const CdRegion* region = disc_->regionAt(currentLba_);
+    const bool audioSector =
+        region != nullptr && region->type == CdRegion::Type::Audio;
+    bool ok = false;
+    if (audioSector) {
+        // Audio sectors are delivered as raw PCM regardless of mode: they do
+        // not carry CD-ROM headers or a user-data payload.
+        ok = disc_->readRawSector(currentLba_, sector_.data(), sector_.size());
+        if (ok) {
+            sectorLength_ = 2352;
         }
-        sectorLength_ = 2340;
-        std::memmove(sector_.data(), sector_.data() + 12, sectorLength_);
+    } else if ((mode_ & 0x20u) != 0) {
+        ok = disc_->readRawSector(currentLba_, sector_.data(), sector_.size());
+        if (ok) {
+            sectorLength_ = 2340;
+            std::memmove(sector_.data(), sector_.data() + 12, sectorLength_);
+        }
     } else {
         std::array<uint8_t, CdImage::kDataSectorSize> data{};
-        if (!disc_->readSectorData(currentLba_, data)) {
-            setError(0x04);
-            state_ = State::Idle;
-            return;
+        ok = disc_->readSectorData(currentLba_, data);
+        if (ok) {
+            std::memcpy(sector_.data(), data.data(), data.size());
+            sectorLength_ = 2048;
         }
-        std::memcpy(sector_.data(), data.data(), data.size());
-        sectorLength_ = 2048;
+    }
+    if (!ok) {
+        setError(0x04);
+        state_ = State::Idle;
+        return;
     }
     sectorPosition_ = 0;
     sectorReady_ = true;
     pushResponse(0x01u, {statusByte()});
+    ++stats_.sectorsRead;
     ++currentLba_;
 }
 
@@ -897,6 +1366,7 @@ bool Cdrom::dmaRead(uint32_t& value) {
         }
         value |= static_cast<uint32_t>(data) << (byte * 8u);
     }
+    ++stats_.dmaWords;
     if (sectorPosition_ >= sectorLength_) {
         sectorReady_ = false;
     }

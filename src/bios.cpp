@@ -68,13 +68,13 @@ void Bios::padInit(uint32_t buf1, uint32_t siz1, uint32_t buf2, uint32_t siz2) {
         for (unsigned i = 0; i < 0x22u; ++i) {
             memory_.write8(padBuf1_ + i, 0);
         }
-        memory_.write8(padBuf1_ + 1, 0x41);
+        memory_.write8(padBuf1_ + 1, 0x73);
     }
     if (padBuf2_ != 0) {
         for (unsigned i = 0; i < 0x22u; ++i) {
             memory_.write8(padBuf2_ + i, 0);
         }
-        memory_.write8(padBuf2_ + 1, 0x41);
+        memory_.write8(padBuf2_ + 1, 0x73);
     }
 }
 
@@ -90,22 +90,36 @@ void Bios::setPadButtons(uint16_t buttons) {
     system_.setPadButtons(buttons);
 }
 
+void Bios::setPadSticks(uint8_t leftX, uint8_t leftY, uint8_t rightX, uint8_t rightY) {
+    system_.setPadSticks(leftX, leftY, rightX, rightY);
+}
+
 uint16_t Bios::padButtons() const {
     return system_.padButtons();
 }
 
 void Bios::padUpdate() {
+    system_.refreshPadFromSource();
+    const uint16_t buttons = system_.padButtons();
     if (padBuf1_ != 0) {
         memory_.write8(padBuf1_ + 0, 0);
-        memory_.write8(padBuf1_ + 1, 0x41);
-        memory_.write8(padBuf1_ + 2, static_cast<uint8_t>(system_.padButtons() & 0xFFu));
-        memory_.write8(padBuf1_ + 3, static_cast<uint8_t>((system_.padButtons() >> 8) & 0xFFu));
+        memory_.write8(padBuf1_ + 1, 0x73);
+        memory_.write8(padBuf1_ + 2, static_cast<uint8_t>(buttons & 0xFFu));
+        memory_.write8(padBuf1_ + 3, static_cast<uint8_t>((buttons >> 8) & 0xFFu));
+        memory_.write8(padBuf1_ + 4, system_.padRightX());
+        memory_.write8(padBuf1_ + 5, system_.padRightY());
+        memory_.write8(padBuf1_ + 6, system_.padLeftX());
+        memory_.write8(padBuf1_ + 7, system_.padLeftY());
     }
     if (padBuf2_ != 0) {
         memory_.write8(padBuf2_ + 0, 0);
-        memory_.write8(padBuf2_ + 1, 0x41);
-        memory_.write8(padBuf2_ + 2, static_cast<uint8_t>(system_.padButtons() & 0xFFu));
-        memory_.write8(padBuf2_ + 3, static_cast<uint8_t>((system_.padButtons() >> 8) & 0xFFu));
+        memory_.write8(padBuf2_ + 1, 0x73);
+        memory_.write8(padBuf2_ + 2, static_cast<uint8_t>(buttons & 0xFFu));
+        memory_.write8(padBuf2_ + 3, static_cast<uint8_t>((buttons >> 8) & 0xFFu));
+        memory_.write8(padBuf2_ + 4, system_.padRightX());
+        memory_.write8(padBuf2_ + 5, system_.padRightY());
+        memory_.write8(padBuf2_ + 6, system_.padLeftX());
+        memory_.write8(padBuf2_ + 7, system_.padLeftY());
     }
 }
 
@@ -117,18 +131,36 @@ void Bios::reset() {
     heapSize_ = 0;
     randState_ = 1;
     installed_ = false;
+    intRpChains_.fill(0);
+    inIntRp_ = false;
+    intRpSecond_ = false;
+    intRpAborted_ = false;
+    intRpPriority_ = 0;
+    intRpElement_ = 0;
+    padEnabled_ = false;
+    padAutoAck_ = false;
+    rootCounterAutoAck_.fill(false);
 }
 
 void Bios::install() {
     if (installed_) {
         return;
     }
-    tableBase_ = 0x8006F000u;
+    tableBase_ = 0x8000C800u;
     for (uint32_t index = 0; index < 0x100; ++index) {
         write32(tableBase_ + index * 4u, 0xC000u | index);
         write32(tableBase_ + 0x400u + index * 4u, 0xB000u | index);
     }
+    write32(tableBase_ + 6u * 4u, 0x80000C80u);
+    const uint32_t handler = 0x80000C80u;
+    write32(handler + 0x28u, 0xAF410004u);
+    write32(handler + 0x2Cu, 0xAF420008u);
+    write32(handler + 0x30u, 0xAF43000Cu);
+    write32(handler + 0x34u, 0xAF5F007Cu);
+    write32(handler + 0x38u, 0x40037000u);
+    write32(handler + 0x3Cu, 0x00000000u);
     cpu_.setInstructionHook([this](uint32_t pc) { return onInstruction(pc); });
+    cpu_.setJitHookCompatible(true);
     cpu_.setSyscallHandler([this]() { return onSyscall(); });
     system_.setVBlankHandler([this]() { handleVBlank(); });
     system_.setIrqHandler([this]() { handleIrq(); });
@@ -170,7 +202,7 @@ void Bios::handleCdromInterrupt(uint8_t interrupt) {
 }
 
 void Bios::handleIrq() {
-    if (entryInt_ == 0 || inEntryInt_ || inBiosCall_ || cpu_.halted()) {
+    if (entryInt_ == 0 || inEntryInt_ || inIntRp_ || inBiosCall_ || cpu_.halted()) {
         return;
     }
     if (cpu_.inDelaySlot() || cpu_.pendingLoadActive()) {
@@ -179,7 +211,102 @@ void Bios::handleIrq() {
     if ((cpu_.status() & 0x404u) != 0x404u || !system_.irqPending()) {
         return;
     }
-    enterEntryInt();
+    startIntRpChain();
+}
+
+void Bios::saveCpuState(SavedCpuState& state) const {
+    for (uint32_t index = 0; index < 32; ++index) {
+        state.regs[index] = cpu_.reg(static_cast<uint8_t>(index));
+    }
+    state.pc = cpu_.pc();
+    state.hi = cpu_.hi();
+    state.lo = cpu_.lo();
+}
+
+void Bios::restoreCpuState(const SavedCpuState& state) {
+    for (uint32_t index = 0; index < 32; ++index) {
+        cpu_.setReg(static_cast<uint8_t>(index), state.regs[index]);
+    }
+    cpu_.setHiLo(state.hi, state.lo);
+    cpu_.setPc(state.pc);
+}
+
+void Bios::startIntRpChain() {
+    saveCpuState(savedState_);
+    inIntRp_ = true;
+    intRpAborted_ = false;
+    intRpSecond_ = false;
+    intRpPriority_ = 0;
+    intRpElement_ = intRpChains_[0];
+    while (intRpElement_ == 0 && intRpPriority_ < 3) {
+        ++intRpPriority_;
+        intRpElement_ = intRpChains_[intRpPriority_];
+    }
+    if (intRpElement_ == 0) {
+        finishIntRpChain();
+        return;
+    }
+    const uint32_t first = read32(intRpElement_ + 8);
+    if (first == 0) {
+        advanceIntRpChain();
+        return;
+    }
+    beginIntRpCall(first, false);
+}
+
+void Bios::beginIntRpCall(uint32_t function, bool second) {
+    restoreCpuState(savedState_);
+    intRpSecond_ = second;
+    cpu_.setReg(kRa, kIntRpReturn);
+    cpu_.setPc(function);
+}
+
+void Bios::finishIntRpCall() {
+    const uint32_t result = cpu_.reg(kV0);
+    if (!intRpSecond_) {
+        const uint32_t second = read32(intRpElement_ + 4);
+        if (result != 0 && second != 0) {
+            beginIntRpCall(second, true);
+            return;
+        }
+    }
+    advanceIntRpChain();
+}
+
+void Bios::advanceIntRpChain() {
+    uint32_t next = read32(intRpElement_ + 0);
+    while (next == 0 && intRpPriority_ < 3) {
+        ++intRpPriority_;
+        next = intRpChains_[intRpPriority_];
+    }
+    if (next == 0) {
+        finishIntRpChain();
+        return;
+    }
+    intRpElement_ = next;
+    const uint32_t first = read32(intRpElement_ + 8);
+    if (first == 0) {
+        advanceIntRpChain();
+        return;
+    }
+    beginIntRpCall(first, false);
+}
+
+void Bios::finishIntRpChain() {
+    restoreCpuState(savedState_);
+    inIntRp_ = false;
+    intRpSecond_ = false;
+    if (!intRpAborted_ && entryInt_ != 0) {
+        enterEntryInt();
+    }
+    intRpAborted_ = false;
+}
+
+void Bios::abortIntRpChain() {
+    restoreCpuState(savedState_);
+    inIntRp_ = false;
+    intRpSecond_ = false;
+    intRpAborted_ = false;
 }
 
 void Bios::enterEntryInt() {
@@ -234,6 +361,28 @@ void Bios::leaveEntryInt() {
 }
 
 bool Bios::onInstruction(uint32_t pc) {
+    static const char* tracePcText = std::getenv("PSXREBORN_TRACE_PC");
+    static const uint32_t tracePc =
+        tracePcText != nullptr ? static_cast<uint32_t>(std::strtoul(tracePcText, nullptr, 16))
+                               : 0u;
+    if (tracePc != 0 && pc == tracePc) {
+        std::fprintf(stderr,
+                     "[PC] pc=0x%08X a0=0x%08X a1=0x%08X a2=0x%08X ra=0x%08X counter=0x%08X\n",
+                     pc, cpu_.reg(kA0), cpu_.reg(kA1), cpu_.reg(kA2), cpu_.reg(kRa),
+                     read32(0x8006639Cu));
+    }
+    static const bool pcSample = std::getenv("PSXREBORN_PC_SAMPLE") != nullptr;
+    static uint64_t sampleCounter = 0;
+    if (pcSample && (++sampleCounter % 100000u) == 0) {
+        std::fprintf(stderr, "[SAMPLE] pc=0x%08X ra=0x%08X\n", pc, cpu_.reg(kRa));
+    }
+    if (pc == kIntRpReturn) {
+        if (inIntRp_) {
+            finishIntRpCall();
+            return true;
+        }
+        return false;
+    }
     if (pc == kEntryIntReturn) {
         if (inEntryInt_) {
             leaveEntryInt();
@@ -272,7 +421,9 @@ bool Bios::onInstruction(uint32_t pc) {
     inBiosCall_ = false;
     if (returnFromException_) {
         returnFromException_ = false;
-        if (inEntryInt_) {
+        if (inIntRp_) {
+            abortIntRpChain();
+        } else if (inEntryInt_) {
             leaveEntryInt();
         }
     } else {
@@ -460,9 +611,64 @@ std::string Bios::formatString(uint32_t formatAddress, unsigned firstRegister) c
 }
 
 uint32_t Bios::openFile(const std::string& path, uint32_t mode) {
-    if ((mode & 3u) != 1u) {
+    if ((mode & 3u) == 0u) {
         return 0xFFFFFFFFu;
     }
+    unsigned cardSlot = 0;
+    std::string cardName;
+    if (MemoryCard* card = cardForPath(path, cardSlot, cardName)) {
+        const bool create = (mode & 0x200u) != 0;
+        const bool writable = (mode & 2u) != 0;
+        std::optional<MemoryCardFileInfo> info = card->findFile(cardName);
+        if (!info && create) {
+            uint32_t blocks = (mode >> 16u) & 0xFFu;
+            if (blocks == 0) {
+                blocks = 1;
+            }
+            if (blocks > 15) {
+                blocks = 15;
+            }
+            std::string error;
+            if (card->createFile(cardName, blocks, error) < 0) {
+                return 0xFFFFFFFFu;
+            }
+            info = card->findFile(cardName);
+        }
+        if (!info) {
+            return 0xFFFFFFFFu;
+        }
+        if (info->deleted) {
+            if (!card->undeleteFile(cardName)) {
+                return 0xFFFFFFFFu;
+            }
+            info = card->findFile(cardName);
+            if (!info) {
+                return 0xFFFFFFFFu;
+            }
+        }
+        for (size_t index = 3; index < files_.size(); ++index) {
+            if (!files_[index].used) {
+                files_[index] = {};
+                files_[index].used = true;
+                files_[index].position = 0;
+                files_[index].card = true;
+                files_[index].cardPtr = card;
+                files_[index].cardName = cardName;
+                files_[index].cardSize = info->size;
+                files_[index].writable = writable;
+                return static_cast<uint32_t>(index);
+            }
+        }
+        files_.push_back({});
+        files_.back().used = true;
+        files_.back().card = true;
+        files_.back().cardPtr = card;
+        files_.back().cardName = cardName;
+        files_.back().cardSize = info->size;
+        files_.back().writable = writable;
+        return static_cast<uint32_t>(files_.size() - 1);
+    }
+
     std::string normalized = path;
     const size_t colon = normalized.find(':');
     if (colon != std::string::npos) {
@@ -476,22 +682,20 @@ uint32_t Bios::openFile(const std::string& path, uint32_t mode) {
     }
     std::vector<uint8_t> data;
     if (!disc_->readFile(normalized, data)) {
-        
         return 0xFFFFFFFFu;
     }
     for (size_t index = 3; index < files_.size(); ++index) {
         if (!files_[index].used) {
+            files_[index] = {};
             files_[index].used = true;
             files_[index].data = std::move(data);
             files_[index].position = 0;
-            
             return static_cast<uint32_t>(index);
         }
     }
     files_.push_back({});
     files_.back().used = true;
     files_.back().data = std::move(data);
-    
     return static_cast<uint32_t>(files_.size() - 1);
 }
 
@@ -500,13 +704,26 @@ uint32_t Bios::readFile(uint32_t fd, uint32_t address, uint32_t size) {
         return 0xFFFFFFFFu;
     }
     OpenFile& file = files_[fd];
+    if (file.card) {
+        const size_t available = file.position < file.cardSize ? file.cardSize - file.position : 0;
+        const size_t count = std::min<size_t>(size, available);
+        if (count != 0) {
+            std::vector<uint8_t> buffer(count);
+            if (!file.cardPtr->readFile(file.cardName, static_cast<uint32_t>(file.position),
+                                        buffer.data(), count)) {
+                return 0xFFFFFFFFu;
+            }
+            memory_.writeBytes(address, buffer.data(), count);
+            file.position += count;
+        }
+        return static_cast<uint32_t>(count);
+    }
     const size_t available = file.position < file.data.size() ? file.data.size() - file.position : 0;
     const size_t count = std::min<size_t>(size, available);
     if (count != 0) {
         memory_.writeBytes(address, file.data.data() + file.position, count);
         file.position += count;
     }
-    
     return static_cast<uint32_t>(count);
 }
 
@@ -518,6 +735,26 @@ uint32_t Bios::writeFile(uint32_t fd, uint32_t address, uint32_t size) {
             text[index] = static_cast<char>(read8(address + index));
         }
         print(text);
+        return size;
+    }
+    if (fd < files_.size() && files_[fd].used && files_[fd].card) {
+        OpenFile& file = files_[fd];
+        if (!file.writable) {
+            return 0xFFFFFFFFu;
+        }
+        std::vector<uint8_t> buffer(size);
+        for (uint32_t index = 0; index < size; ++index) {
+            buffer[index] = read8(address + index);
+        }
+        if (!file.cardPtr->writeFile(file.cardName, static_cast<uint32_t>(file.position),
+                                     buffer.data(), buffer.size())) {
+            return 0xFFFFFFFFu;
+        }
+        file.position += size;
+        const auto info = file.cardPtr->findFile(file.cardName);
+        if (info) {
+            file.cardSize = info->size;
+        }
         return size;
     }
     return 0xFFFFFFFFu;
@@ -534,7 +771,7 @@ uint32_t Bios::seekFile(uint32_t fd, int32_t offset, uint32_t whence) {
     } else if (whence == 1) {
         position = static_cast<int64_t>(file.position) + offset;
     } else if (whence == 2) {
-        position = static_cast<int64_t>(file.data.size()) + offset;
+        position = static_cast<int64_t>(file.card ? file.cardSize : file.data.size()) + offset;
     } else {
         return 0xFFFFFFFFu;
     }
@@ -549,8 +786,112 @@ uint32_t Bios::closeFile(uint32_t fd) {
     if (fd >= files_.size() || !files_[fd].used) {
         return 0xFFFFFFFFu;
     }
+    if (files_[fd].card) {
+        persistCard(files_[fd].cardPtr);
+        for (auto iterator = cardFcb_.begin(); iterator != cardFcb_.end();) {
+            if (iterator->second == fd) {
+                iterator = cardFcb_.erase(iterator);
+            } else {
+                ++iterator;
+            }
+        }
+    }
     files_[fd] = {};
     return 0;
+}
+
+MemoryCard* Bios::cardForPath(const std::string& path, unsigned& slot, std::string& name) const {
+    std::string lower = path;
+    for (char& character : lower) {
+        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    }
+    if (lower.size() < 4 || lower[0] != 'b' || lower[1] != 'u' || lower[2] < '0' ||
+        lower[2] > '1') {
+        return nullptr;
+    }
+    const size_t colon = lower.find(':');
+    if (colon == std::string::npos) {
+        return nullptr;
+    }
+    slot = static_cast<unsigned>(lower[2] - '0');
+    name = path.substr(colon + 1);
+    while (!name.empty() && (name.front() == '\\' || name.front() == '/')) {
+        name.erase(name.begin());
+    }
+    return system_.memoryCard(slot);
+}
+
+uint32_t Bios::writeDirectoryEntry(uint32_t address, const MemoryCardFileInfo& info) {
+    std::array<uint8_t, 0x28> entry{};
+    const size_t nameLength = std::min<size_t>(info.name.size(), 19);
+    std::memcpy(entry.data(), info.name.data(), nameLength);
+    const uint32_t attribute = info.deleted ? 0xA0u : 0x50u;
+    const uint32_t size = info.size != 0 ? info.size : info.blocks * MemoryCard::kBlockSize;
+    for (unsigned index = 0; index < 4; ++index) {
+        entry[0x14 + index] = static_cast<uint8_t>((attribute >> (index * 8)) & 0xFFu);
+        entry[0x18 + index] = static_cast<uint8_t>((size >> (index * 8)) & 0xFFu);
+        entry[0x20 + index] = static_cast<uint8_t>((info.firstBlock >> (index * 8)) & 0xFFu);
+    }
+    memory_.writeBytes(address, entry.data(), entry.size());
+    return address;
+}
+
+uint32_t Bios::cardFirstFile(const std::string& path, uint32_t direntry) {
+    unsigned slot = 0;
+    std::string pattern;
+    MemoryCard* card = cardForPath(path, slot, pattern);
+    if (card == nullptr) {
+        return 0;
+    }
+    cardSearchSlot_ = slot;
+    cardSearchIndex_ = 0;
+    cardSearch_ = card->matchFiles(pattern);
+    return cardNextFile(direntry);
+}
+
+uint32_t Bios::cardNextFile(uint32_t direntry) {
+    MemoryCard* card = system_.memoryCard(cardSearchSlot_);
+    if (card == nullptr || cardSearchIndex_ >= cardSearch_.size()) {
+        return 0;
+    }
+    return writeDirectoryEntry(direntry, cardSearch_[cardSearchIndex_++]);
+}
+
+uint32_t Bios::openCardByFcb(uint32_t fcb, const std::string& path, uint32_t mode) {
+    const uint32_t fd = openFile(path, mode);
+    if (fd == 0xFFFFFFFFu) {
+        return 0;
+    }
+    cardFcb_[fcb] = fd;
+    return 1;
+}
+
+uint32_t Bios::cardFcbFd(uint32_t fcb) const {
+    const auto iterator = cardFcb_.find(fcb);
+    return iterator == cardFcb_.end() ? 0xFFFFFFFFu : iterator->second;
+}
+
+bool Bios::persistCard(MemoryCard* card) {
+    if (card == nullptr) {
+        return false;
+    }
+    if (card->path().empty()) {
+        return true;
+    }
+    std::string error;
+    if (!card->saveIfDirty(error)) {
+        std::cerr << "[BIOS] memory card save failed: " << error << "\n";
+        return false;
+    }
+    return true;
+}
+
+void Bios::cardFormat(MemoryCard* card) {
+    if (card == nullptr) {
+        return;
+    }
+    card->format();
+    persistCard(card);
 }
 
 uint32_t Bios::openEvent(uint32_t classId, uint32_t specId, uint32_t mode, uint32_t handler) {
@@ -1037,6 +1378,78 @@ void Bios::a0Call(uint8_t function) {
         case 0x4E:
             cpu_.setReg(kV0, 0);
             return;
+        case 0x65:
+            cpu_.setReg(kV0, openCardByFcb(cpu_.reg(kA0), readString(cpu_.reg(kA1)),
+                                            cpu_.reg(kA2)));
+            return;
+        case 0x66:
+            cpu_.setReg(kV0, readFile(cardFcbFd(cpu_.reg(kA0)), cpu_.reg(kA1),
+                                      cpu_.reg(kA2)));
+            return;
+        case 0x67:
+            cpu_.setReg(kV0, writeFile(cardFcbFd(cpu_.reg(kA0)), cpu_.reg(kA1),
+                                       cpu_.reg(kA2)));
+            return;
+        case 0x68:
+            cpu_.setReg(kV0, closeFile(cardFcbFd(cpu_.reg(kA0))));
+            return;
+        case 0x69:
+            cpu_.setReg(kV0, cardFirstFile(readString(cpu_.reg(kA1)), cpu_.reg(kA2)));
+            return;
+        case 0x6A:
+            cpu_.setReg(kV0, cardNextFile(cpu_.reg(kA1)));
+            return;
+        case 0x6B:
+        case 0x6C: {
+            unsigned slot = 0;
+            std::string name;
+            MemoryCard* card = cardForPath(readString(cpu_.reg(kA1)), slot, name);
+            bool ok = false;
+            if (card != nullptr) {
+                ok = function == 0x6B ? card->deleteFile(name) : card->undeleteFile(name);
+                if (ok) {
+                    persistCard(card);
+                }
+            }
+            cpu_.setReg(kV0, ok ? 1u : 0u);
+            return;
+        }
+        case 0x6D: {
+            unsigned slot = 0;
+            std::string name = readString(cpu_.reg(kA0));
+            MemoryCard* card = cardForPath(name, slot, name);
+            if (card == nullptr) {
+                card = system_.memoryCard(0);
+            }
+            cardFormat(card);
+            cpu_.setReg(kV0, card != nullptr ? 1u : 0u);
+            return;
+        }
+        case 0x6E: {
+            unsigned slot = 0;
+            std::string oldName;
+            std::string newName;
+            MemoryCard* oldCard = cardForPath(readString(cpu_.reg(kA1)), slot, oldName);
+            MemoryCard* newCard = cardForPath(readString(cpu_.reg(kA3)), slot, newName);
+            const bool ok = oldCard != nullptr && oldCard == newCard &&
+                            oldCard->renameFile(oldName, newName);
+            if (ok) {
+                persistCard(oldCard);
+            }
+            cpu_.setReg(kV0, ok ? 1u : 0u);
+            return;
+        }
+        case 0x6F:
+            cpu_.setReg(kV0, 0);
+            return;
+        case 0xAB:
+            cpu_.setReg(kV0, system_.memoryCard(cpu_.reg(kA0)) != nullptr ? 1u : 0u);
+            return;
+        case 0xAC:
+        case 0xAD:
+        case 0xAE:
+            cpu_.setReg(kV0, 0);
+            return;
         case 0x54:
         case 0x70:
             cpu_.setReg(kV0, 1);
@@ -1131,9 +1544,13 @@ void Bios::b0Call(uint8_t function) {
             uint32_t buttons = system_.padButtons();
             if (padBuf1_ != 0) {
                 memory_.write8(padBuf1_ + 0, 0);
-                memory_.write8(padBuf1_ + 1, 0x41);
+                memory_.write8(padBuf1_ + 1, 0x73);
                 memory_.write8(padBuf1_ + 2, static_cast<uint8_t>(buttons & 0xFFu));
                 memory_.write8(padBuf1_ + 3, static_cast<uint8_t>((buttons >> 8) & 0xFFu));
+                memory_.write8(padBuf1_ + 4, system_.padRightX());
+                memory_.write8(padBuf1_ + 5, system_.padRightY());
+                memory_.write8(padBuf1_ + 6, system_.padLeftX());
+                memory_.write8(padBuf1_ + 7, system_.padLeftY());
             }
             cpu_.setReg(kV0, (static_cast<uint32_t>(system_.padButtons() >> 8) << 0) |
                              (static_cast<uint32_t>(system_.padButtons() & 0xFFu) << 8));
@@ -1207,23 +1624,121 @@ void Bios::b0Call(uint8_t function) {
             print(readString(cpu_.reg(kA0)) + "\n");
             cpu_.setReg(kV0, 0);
             return;
+        case 0x41: {
+            unsigned slot = 0;
+            std::string name;
+            MemoryCard* card = cardForPath(readString(cpu_.reg(kA0)), slot, name);
+            cardFormat(card);
+            cpu_.setReg(kV0, card != nullptr ? 1u : 0u);
+            return;
+        }
         case 0x42:
+            cpu_.setReg(kV0, cardFirstFile(readString(cpu_.reg(kA0)), cpu_.reg(kA1)));
+            return;
         case 0x43:
+            cpu_.setReg(kV0, cardNextFile(cpu_.reg(kA0)));
+            return;
+        case 0x44: {
+            unsigned slot = 0;
+            std::string oldName;
+            std::string newName;
+            MemoryCard* oldCard = cardForPath(readString(cpu_.reg(kA0)), slot, oldName);
+            MemoryCard* newCard = cardForPath(readString(cpu_.reg(kA1)), slot, newName);
+            const bool ok = oldCard != nullptr && oldCard == newCard &&
+                            oldCard->renameFile(oldName, newName);
+            if (ok) {
+                persistCard(oldCard);
+            }
+            cpu_.setReg(kV0, ok ? 1u : 0u);
+            return;
+        }
+        case 0x45:
+        case 0x46: {
+            unsigned slot = 0;
+            std::string name;
+            MemoryCard* card = cardForPath(readString(cpu_.reg(kA0)), slot, name);
+            bool ok = false;
+            if (card != nullptr) {
+                ok = function == 0x45 ? card->deleteFile(name) : card->undeleteFile(name);
+                if (ok) {
+                    persistCard(card);
+                }
+            }
+            cpu_.setReg(kV0, ok ? 1u : 0u);
+            return;
+        }
+        case 0x4A:
+        case 0x4B:
+        case 0x4C:
             cpu_.setReg(kV0, 0);
+            return;
+        case 0x4D:
+            cpu_.setReg(kV0, system_.memoryCard(cpu_.reg(kA0)) != nullptr ? 1u : 0u);
+            return;
+        case 0x4E:
+        case 0x4F: {
+            const unsigned slot = cpu_.reg(kA0);
+            const uint32_t sector = cpu_.reg(kA1);
+            const uint32_t address = cpu_.reg(kA2);
+            MemoryCard* card = system_.memoryCard(slot);
+            if (card == nullptr) {
+                cpu_.setReg(kV0, 0);
+                return;
+            }
+            std::array<uint8_t, 128> buffer{};
+            bool ok = false;
+            if (function == 0x4E) {
+                memory_.readBytes(address, buffer.data(), buffer.size());
+                ok = card->writeSector(sector, buffer.data(), buffer.size());
+                if (ok) {
+                    persistCard(card);
+                }
+            } else {
+                ok = card->readSector(sector, buffer.data(), buffer.size());
+                if (ok) {
+                    memory_.writeBytes(address, buffer.data(), buffer.size());
+                }
+            }
+            cpu_.setReg(kV0, ok ? 1u : 0u);
+            return;
+        }
+        case 0x50:
+            cpu_.setReg(kV0, 1);
             return;
         case 0x54:
         case 0x55:
             cpu_.setReg(kV0, 0);
             return;
+        case 0x58:
+            cpu_.setReg(kV0, 0);
+            return;
+        case 0x59: {
+            unsigned slot = 0;
+            std::string name;
+            const std::string device = readString(cpu_.reg(kA0));
+            if (cardForPath(device, slot, name) != nullptr) {
+                cpu_.setReg(kV0, 1);
+            } else {
+                std::string lower = device;
+                for (char& character : lower) {
+                    character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+                }
+                cpu_.setReg(kV0, lower.rfind("cdrom", 0) == 0 ? 1u : 0u);
+            }
+            return;
+        }
         case 0x56:
             cpu_.setReg(kV0, tableBase_);
             return;
         case 0x57:
             cpu_.setReg(kV0, tableBase_ + 0x400u);
             return;
-        case 0x5B:
-            cpu_.setReg(kV0, 0);
+        case 0x5B: {
+            const bool previous = padAutoAck_;
+            padAutoAck_ = (cpu_.reg(kA0) & 1u) != 0;
+            cpu_.setReg(kV0, previous ? 1u : 0u);
             return;
+        }
         default:
             std::cerr << "[BIOS] unimplemented B0:" << std::hex << static_cast<unsigned>(function)
                       << std::dec << " a0=0x" << std::hex << cpu_.reg(kA0) << " a1=0x"
@@ -1235,16 +1750,62 @@ void Bios::b0Call(uint8_t function) {
 
 void Bios::c0Call(uint8_t function) {
     switch (function) {
+        case 0x02: {
+            const uint32_t priority = cpu_.reg(kA0);
+            const uint32_t structure = cpu_.reg(kA1);
+            if (priority < intRpChains_.size() && structure != 0) {
+                write32(structure, intRpChains_[priority]);
+                intRpChains_[priority] = structure;
+                cpu_.setReg(kV0, 0);
+            } else {
+                cpu_.setReg(kV0, 0xFFFFFFFFu);
+            }
+            return;
+        }
+        case 0x03: {
+            const uint32_t priority = cpu_.reg(kA0);
+            const uint32_t structure = cpu_.reg(kA1);
+            if (priority < intRpChains_.size() && structure != 0) {
+                if (intRpChains_[priority] == structure) {
+                    const uint32_t next = read32(structure);
+                    write32(structure, 0);
+                    intRpChains_[priority] = next;
+                } else {
+                    uint32_t previous = intRpChains_[priority];
+                    while (previous != 0) {
+                        const uint32_t next = read32(previous);
+                        if (next == structure) {
+                            write32(previous, read32(structure));
+                            write32(structure, 0);
+                            break;
+                        }
+                        previous = next;
+                    }
+                }
+                cpu_.setReg(kV0, 0);
+            } else {
+                cpu_.setReg(kV0, 0xFFFFFFFFu);
+            }
+            return;
+        }
+        case 0x0A: {
+            const uint32_t source = cpu_.reg(kA0);
+            if (source < rootCounterAutoAck_.size()) {
+                const uint32_t previous = rootCounterAutoAck_[source] ? 1u : 0u;
+                rootCounterAutoAck_[source] = (cpu_.reg(kA1) & 1u) != 0;
+                cpu_.setReg(kV0, previous);
+            } else {
+                cpu_.setReg(kV0, 0);
+            }
+            return;
+        }
         case 0x00:
         case 0x01:
-        case 0x02:
-        case 0x03:
         case 0x04:
         case 0x05:
         case 0x06:
         case 0x07:
         case 0x08:
-        case 0x0A:
         case 0x0C:
         case 0x0D:
         case 0x12:

@@ -1,20 +1,14 @@
 # PSXReborn Architecture
 
-## Current Milestone
+## Current State
 
-Milestone 1 provides a complete integer execution slice for self-contained PS-X
-EXE programs:
-
-```text
-PS-X EXE file
-    -> header parsing and validation
-    -> guest memory load (payload and BSS)
-    -> MIPS R3000A integer instruction interpreter
-    -> CLI inspection and bounded execution
-```
-
-The implementation is intentionally narrow. It does not yet load a BIOS, boot a
-disc, run commercial games, emulate coprocessors, or generate native code.
+PSXReborn parses PS-X EXE files and disc images, boots `SYSTEM.CNF` through BIOS
+HLE hooks, executes MIPS R3000A code with an interpreter or JIT, and models
+interrupts, timers, DMA, GPU commands, partial SPU behavior, CD-ROM, SIO0
+controllers, and memory cards. The SDL2 frontend provides the current display,
+audio, and input path. Vulkan support is currently limited to embedded shader
+modules and specialization constants. Detailed verified status is maintained in
+`docs/IMPLEMENTATION_STAGES.md`.
 
 ## Code Layout
 
@@ -24,6 +18,11 @@ disc, run commercial games, emulate coprocessors, or generate native code.
 | `include/psxreborn/psx_exe.hpp`, `src/psx_exe.cpp` | PS-X EXE header parsing and load validation |
 | `include/psxreborn/mips.hpp`, `src/mips.cpp` | Instruction decoding and branch/jump target calculation |
 | `include/psxreborn/cpu.hpp`, `src/cpu.cpp` | Integer interpreter, delay slots, load delay, stop conditions |
+| `include/psxreborn/sio0.hpp`, `src/sio0.cpp` | SIO0 controller/memory-card serial ports, status and control registers |
+| `include/psxreborn/pad.hpp`, `src/pad.cpp` | Active-low PS1 pad state assembled from keyboard, controller, and stick sources |
+| `include/psxreborn/bios.hpp`, `src/bios.cpp` | BIOS HLE calls, including the pad buffer interface |
+| `include/psxreborn/vulkan_shader.hpp`, `src/vulkan_shader.cpp` | Embedded SPIR-V lookup, validation, specialization constants, and `VkShaderModule` creation |
+| `shaders/`, `tools/embed_spirv.py`, `tools/build_shaders.sh` | GLSL sources, build-time compilation, and C++ embedding |
 | `tools/psxreborn.cpp` | `inspect` and `run` command-line interface |
 | `tests/` | Unit, integration, and CLI end-to-end tests |
 
@@ -59,6 +58,109 @@ The 8 MB mirror follows the accidental two-megabyte aliases documented in
 `docs/memorycontrol.md`. RAM size is not configurable yet. Halfword and word
 accesses require alignment; unaligned accesses produce an address error.
 Scratchpad execution and KSEG1 scratchpad access are deliberately unsupported.
+
+## SIO0 Controller Emulation
+
+The core implements the digital controller poll sequence on SIO0 at
+`0x1F801040-0x1F80104F`. A transaction is started by enabling TX and asserting
+the port select line in `SIO0_CR` (bits 0 and 1), then writing the device
+address `0x01`. A digital pad is identified by the first `0x42` command byte.
+
+The controller ports are **SIO0** (`0x1F801040`); `0x1F801050-0x1F80105F` is
+the unrelated SIO1 UART used by the serial port and must not be used for pad
+polling.
+
+Verified response sequence for a digital pad:
+
+| Host command | Pad response | Meaning |
+| --- | --- | --- |
+| `0x01` | `0xFF` | Device address, pad pulls ACK low |
+| `0x42` | `0x41` | Digital pad ID low byte |
+| `0x00` | `0x5A` | ID high byte / data marker |
+| `0x00` | buttons low | Select, Start, D-pad, L1/R1 low byte |
+| `0x00` | buttons high | L2/R2, Triangle, Circle, Cross, Square |
+
+Button bits are active-low. The verified PS1 switch mapping is:
+
+| Bit | Button | Bit | Button |
+| --- | --- | --- | --- |
+| 0 | Select | 8 | L2 |
+| 1 | L3 (analog mode only) | 9 | R2 |
+| 2 | R3 (analog mode only) | 10 | L1 |
+| 3 | Start | 11 | R1 |
+| 4 | D-pad Up | 12 | Triangle |
+| 5 | D-pad Right | 13 | Circle |
+| 6 | D-pad Down | 14 | Cross |
+| 7 | D-pad Left | 15 | Square |
+
+`SIO0_SR` exposes TX-ready, RX-not-empty, /ACK level, and the sticky IRQ bit.
+`SIO0_CR` bit 1 asserts /CS, bit 13 selects controller port 1 or 2, bit 4
+acknowledges the IRQ latch, bit 6 resets the channel, bits 8-9 select the RX
+FIFO IRQ threshold (1, 2, 4, or 8 bytes), and bits 11-12 enable RX and /ACK
+interrupts. The receive path has an 8-byte FIFO; an overflow replaces the
+newest entry. Writing to `SIO0_DR` starts a transfer immediately while TX is
+enabled. A byte read from the same register removes one FIFO entry and updates
+the RX-not-empty condition; 16-bit and 32-bit reads consume two and four
+entries respectively. An RX-threshold interrupt is latched as soon as the FIFO
+reaches the configured size. The /ACK interrupt is latched only when bit 12 is
+set, after the emulated /ACK release delay (~130 cycles), matching the BIOS
+requirement that the pad IRQ must not occur in the same cycle as the transfer.
+
+The host input path is SDL2 GameController. On Windows SDL2 uses XInput for
+Xbox-compatible pads; on Linux it uses the kernel gamepad interface. The
+button mapping is A->Cross, B->Circle, X->Square, Y->Triangle, LB->L1,
+RB->R1, Back->Select, Start->Start, with the D-pad passed through. Analog
+triggers drive L2/R2 and the left stick can emulate the D-pad after a
+deadzone. Native backends that receive an XInput digital button mask can use
+`xinputToPadButtons()` or `PadState::setXInputButtons()`; both apply the same
+mapping.
+
+### DualShock / analog pad
+
+The guest-visible device is a DualShock-compatible endpoint
+(`DualShockDevice` in `ps1_pad_device.hpp`). Command `0x42` returns ID `0x41`
+in digital mode (4 data bytes) or `0x73`/`0xF3` in analog/config mode (8 data
+bytes with stick bytes `rightX, rightY, leftX, leftY`). Config commands
+`0x43`, `0x44`, `0x45`, `0x46`, `0x47`, `0x4C`, and `0x4D` are accepted only
+in config mode and latch their data byte on the third transfer tick, matching
+PCSX-Redux. DualShock starts in digital mode; games enable analog via the
+config sequence. Rumble and multitap are not implemented.
+
+### Low-latency input path
+
+`Sio0` samples host input through the `PadSource` interface when the guest
+asserts /CS and writes the pad address byte `0x01`. The snapshot is latched
+for the whole transaction so mid-poll host changes cannot tear a response.
+`XInputBackend` (play tool) refreshes SDL controller state at pad-select time
+(throttled to 250 us), independent of host frame cadence, then publishes into
+`PadState`. The BIOS pad path calls `System::refreshPadFromSource()` before
+reading pad state so HLE pad services also see fresh input.
+
+Measured on this machine (Release build, digital `0x42` transaction, no host
+controller attached): full transaction average 99 ns, host update to first
+guest-visible button byte average 92 ns (p99 105 ns). The previous
+frame-quantized path added up to one host frame of delay (16.7 ms at 60 FPS,
+6.9 ms at 144 FPS). Instrumentation is available via
+`PSXREBORN_TRACE_INPUT=1|2`.
+
+## Vulkan Shader Modules
+
+The shader sources live in `shaders/`. CMake compiles them with
+`glslangValidator --target-env vulkan1.1` into `build/shaders/*.spv`, then runs
+`tools/embed_spirv.py` to produce `build/generated/spirv_data.h`. The Python
+script validates the SPIR-V magic word and word alignment before emitting
+`std::array` constants under `psxreborn::embedded_shaders`. When build-time
+shader compilation is disabled, the checked-in fallback
+`src/generated/spirv_data.h` is used.
+
+`vulkan_shader.hpp` exposes `ShaderId`, `embeddedShader`, `validateSpirv`,
+`PresentSpecializationInfo`, and `createShaderModule`. `present.frag` declares
+two specialization constants: `IS_4K` (id 0) and `ENABLE_OVERLAY` (id 1). The
+specialization map uses 32-bit `VkBool32` values, matching Vulkan's bool
+representation. Tests validate every embedded module, the specialization map
+layout, and create real `VkShaderModule` objects on an available Vulkan device;
+they skip with an explicit message when no loader or device is present. There
+is no swapchain, render pass, or PS1 rendering pipeline yet.
 
 ## PS-X EXE Loading
 
@@ -146,16 +248,22 @@ of generated PS-X EXE test images.
 
 ## Known Limitations
 
-- No BIOS image loading, BIOS calls, HLE, or kernel services.
-- No COP0, COP1, COP2/GTE, cache isolation, or exception vectors.
-- No interrupts, timers, DMA, GPU, SPU, CD-ROM, controllers, or memory cards.
-- No ISO 9660 or `SYSTEM.CNF` handling, overlays, or dynamic modules.
-- No native x86-64 translation yet; execution is interpreted.
-- No self-modifying code handling or translated-block invalidation.
+- BIOS behavior is provided by HLE hooks rather than a real BIOS image or a full
+  kernel reimplementation.
+- COP1 (FPU) is not implemented, cache isolation is not modeled, and exception
+  behavior is still incomplete for uncommon paths.
+- SIO0 implements the digital and DualShock pad poll paths plus memory-card
+  commands; rumble, multitap, and mouse are unsupported.
+- Host controller input requires SDL2; the core has no platform input backend
+  compiled in by default (the play tool links XInputBackend).
+- Vulkan support in the core is limited to shader module creation; the play
+  tool owns the Vulkan presenter instance, swapchain, and render pass.
+- Dynamic module and self-modifying-code handling exists but has not been
+  validated across all supported games.
 - No configurable RAM size; the 8 MB mirror is always enabled.
-- I/O and KSEG2 accesses stop execution as unsupported.
-- Arithmetic overflow and address errors stop execution instead of raising
-  guest exceptions.
+- Unimplemented I/O and KSEG2 accesses stop execution as unsupported.
+- Arithmetic overflow and address errors can still terminate execution instead
+  of following every guest exception path.
 - A control-transfer instruction in a delay slot stops as unsupported.
 
 ## References
@@ -168,6 +276,14 @@ against the reference projects:
   mirroring.
 - `docs/cpuspecifications.md` for load delay, branch delay, alignment, and
   unaligned load/store behavior.
+- `docs/serialinterfacessio.md` and `docs/controllersandmemorycards.md` for
+  SIO0 register behavior and the digital-pad protocol.
+- `https://psx-spx.consoledev.net/controllersandmemorycards/` and
+  `https://www.problemkaputt.de/psxspx-serial-port-sio.htm` for the verified
+  poll sequence, controller IDs, switch bits, and SIO0 status/control bits.
+- `/home/vita/pcsx-redux-main/src/core/sio.cc` and `src/core/pad.cc` for the
+  reference SIO0/pad state machines and ACK/IRQ behavior.
+- Microsoft XInput `XINPUT_GAMEPAD` documentation for the host button masks.
 - `/home/vita/pcsx-redux-main/src/supportpsx/binloader.cc` for executable loading.
 - `/home/vita/pcsx-redux-main/src/core/psxinterpreter.cc` and
   `/home/vita/pcsx-redux-main/src/core/r3000a.h` for interpreter behavior.

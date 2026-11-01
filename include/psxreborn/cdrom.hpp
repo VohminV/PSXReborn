@@ -6,6 +6,7 @@
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -21,6 +22,32 @@ struct CdDirEntry {
     std::string name;
 };
 
+struct CdTrack {
+    uint8_t number = 0;
+    bool audio = false;
+    uint32_t index00Lba = 0;
+    uint32_t startLba = 0;
+    uint32_t endLba = 0;
+};
+
+struct CdRegion {
+    enum class Type : uint8_t {
+        Data,
+        Audio,
+        Silence,
+    };
+
+    enum : uint16_t { kNoFile = 0xFFFF };
+
+    Type type = Type::Data;
+    bool index00 = false;
+    uint32_t startLba = 0;
+    uint32_t sectors = 0;
+    uint16_t fileIndex = kNoFile;
+    uint32_t fileStartSector = 0;
+    uint8_t trackNumber = 0;
+};
+
 class CdImage {
 public:
     static constexpr uint32_t kRawSectorSize = 2352;
@@ -32,8 +59,12 @@ public:
     static std::optional<CdImage> fromBytes(std::vector<uint8_t> bytes, std::string& error);
 
     uint32_t sectorCount() const { return sectorCount_; }
-    uint32_t sectorSize() const { return sectorSize_; }
-    bool valid() const { return sectorSize_ != 0; }
+    uint32_t trackCount() const { return static_cast<uint32_t>(tracks_.size()); }
+    bool valid() const { return sectorCount_ != 0 && !tracks_.empty(); }
+
+    const std::vector<CdTrack>& tracks() const { return tracks_; }
+
+    const CdRegion* regionAt(uint32_t lba) const;
 
     bool readRawSector(uint32_t lba, uint8_t* destination, size_t size) const;
     bool readUserSector(uint32_t lba, uint8_t* destination, size_t size) const;
@@ -44,18 +75,38 @@ public:
     std::optional<std::string> bootExecutable(std::string& stackLine) const;
 
 private:
-    bool readAt(uint64_t offset, uint8_t* destination, size_t size) const;
-    bool initialize(std::string& error);
+    struct MediaFile {
+        std::string path;
+        uint64_t size = 0;
+        uint32_t sectorSize = 0;
+        uint32_t dataOffset = 0;
+        uint32_t dataSize = 0;
+        std::unique_ptr<std::ifstream> stream;
+        std::vector<uint8_t> inlineBuffer;
+    };
+
+    bool readAt(const MediaFile& file, uint64_t offset, uint8_t* destination, size_t size) const;
+    bool initializeCue(const std::string& cuePath, const std::string& cueDirectory,
+                       std::vector<MediaFile>& files, std::string& error);
+    bool detectSingleFileLayout(const MediaFile& file, uint32_t& sectorSize, uint32_t& dataOffset,
+                                uint32_t& dataSize);
+    bool buildFallbackTimeline(std::string& error);
     bool readDirectory(uint32_t extent, uint32_t size, std::vector<CdDirEntry>& entries) const;
     static std::string normalizeName(const std::string& name);
     static bool nameEquals(const std::string& left, const std::string& right);
 
-    mutable std::ifstream stream_;
-    std::vector<uint8_t> buffer_;
-    uint32_t sectorSize_ = 0;
-    uint32_t dataOffset_ = 0;
-    uint32_t dataSize_ = 0;
+    std::vector<MediaFile> files_;
     uint32_t sectorCount_ = 0;
+    std::vector<CdRegion> regions_;
+    std::vector<CdTrack> tracks_;
+};
+
+struct CdromStats {
+    uint64_t commands = 0;
+    uint64_t unknownCommands = 0;
+    uint64_t failures = 0;
+    uint64_t sectorsRead = 0;
+    uint64_t dmaWords = 0;
 };
 
 class Cdrom {
@@ -70,6 +121,7 @@ public:
     void setInterruptCallback(std::function<void(uint8_t)> callback) {
         interruptCallback_ = std::move(callback);
     }
+    const CdromStats& stats() const { return stats_; }
 
     bool read8(uint32_t address, uint8_t& value, bool& handled);
     bool write8(uint32_t address, uint8_t value, bool& handled);
@@ -120,6 +172,7 @@ private:
     uint32_t currentLba_ = 0;
     uint32_t seekLba_ = 150;
     uint32_t readCycles_ = 0;
+    uint32_t playCycles_ = 0;
     uint32_t cyclesPerSector_ = 33868800u / 75u;
     std::array<uint8_t, 16> parameter_{};
     uint32_t parameterCount_ = 0;
@@ -134,6 +187,7 @@ private:
     bool sectorReady_ = false;
     bool motorOn_ = false;
     std::function<void(uint8_t)> interruptCallback_;
+    CdromStats stats_{};
 };
 
 }  // namespace psxreborn

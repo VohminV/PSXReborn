@@ -1,4 +1,7 @@
 #include "psxreborn/hardware.hpp"
+
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 
 #include "psxreborn/cpu.hpp"
@@ -6,6 +9,16 @@
 #include "psxreborn/mips.hpp"
 
 namespace psxreborn {
+
+namespace {
+bool traceIo(uint32_t address) {
+    static const bool trace = std::getenv("PSXREBORN_TRACE_IO") != nullptr;
+    return trace && ((address >= 0x1F801040u && address <= 0x1F80105Fu) ||
+                     (address >= 0x1F801070u && address <= 0x1F801077u) ||
+                     (address >= 0x1F801120u && address <= 0x1F80112Bu));
+}
+}  // namespace
+
 
 namespace {
 
@@ -207,7 +220,8 @@ System::System(Memory& memory)
       gpu_(),
       spu_(),
       dma_(memory_, interrupts_, gpu_, &spu_),
-      cdrom_(interrupts_) {
+      cdrom_(interrupts_),
+      sio0_(interrupts_) {
     dma_.setCdrom(&cdrom_);
     memory_.setIoDevice(this);
 }
@@ -223,6 +237,7 @@ void System::reset() {
     spu_.reset();
     dma_.reset();
     cdrom_.reset();
+    sio0_.reset();
     vblankCycles_ = 0;
     hblankCycles_ = 0;
     misc_.fill(0);
@@ -256,6 +271,7 @@ void System::tick(uint32_t cycles) {
     timers_.tick(cycles);
     gpu_.tick(cycles);
     cdrom_.tick(cycles);
+    sio0_.tick(cycles);
     vblankCycles_ += cycles;
     hblankCycles_ += cycles;
     constexpr uint32_t cyclesPerScanline = kCyclesPerFrame / 263u;
@@ -265,6 +281,7 @@ void System::tick(uint32_t cycles) {
     }
     while (vblankCycles_ >= kCyclesPerFrame) {
         vblankCycles_ -= kCyclesPerFrame;
+        ++vblankFrames_;
         interrupts_.request(Interrupts::kVBlank);
         if (vblankHandler_) {
             vblankHandler_();
@@ -277,6 +294,17 @@ void System::tick(uint32_t cycles) {
 
 bool System::irqPending() const {
     return interrupts_.pending();
+}
+
+void System::saveDirtyMemoryCards() {
+    for (MemoryCard* card : cards_) {
+        if (card != nullptr && card->isDirty()) {
+            std::string error;
+            if (!card->saveIfDirty(error)) {
+                std::fprintf(stderr, "[MEMCARD] %s\n", error.c_str());
+            }
+        }
+    }
 }
 
 void System::setFault(MemoryFault* fault, MemoryFault value) {
@@ -300,26 +328,9 @@ bool System::miscIndex(uint32_t address, uint32_t& offset) {
 }
 
 bool System::read8(uint32_t address, uint8_t& value, MemoryFault* fault) {
-    if (address >= 0x1F801050u && address <= 0x1F80105Fu) {
-        if (address == 0x1F801050u) {
-            
-            uint8_t b = 0xFFu;
-            if (sioState_ == 1) {
-                b = 0xFFu;
-            } else if (sioState_ == 2) {
-                if (sioReadIndex_ == 0) b = 0x5Au;
-                else if (sioReadIndex_ == 1) b = static_cast<uint8_t>(padButtons() & 0xFFu);
-                else if (sioReadIndex_ == 2) b = static_cast<uint8_t>((padButtons() >> 8) & 0xFFu);
-                else b = 0x00u;
-                ++sioReadIndex_;
-                if (sioReadIndex_ >= 5) { sioState_ = 0; sioReadIndex_ = 0; }
-            }
-            value = b;
-        } else if (address == 0x1F801054u) {
-            value = 0x05u;
-        } else {
-            value = 0;
-        }
+    if (traceIo(address)) { std::fprintf(stderr, "[IO] R %08X size=%zu\n", address, sizeof(value)); }
+    if (sio0_.handles(address)) {
+        sio0_.read8(address, value);
         setFault(fault, MemoryFault::None);
         return true;
     }
@@ -337,6 +348,12 @@ bool System::read8(uint32_t address, uint8_t& value, MemoryFault* fault) {
 }
 
 bool System::read16(uint32_t address, uint16_t& value, MemoryFault* fault) {
+    if (traceIo(address)) { std::fprintf(stderr, "[IO] R %08X size=%zu\n", address, sizeof(value)); }
+    if (sio0_.handles(address)) {
+        sio0_.read16(address, value);
+        setFault(fault, MemoryFault::None);
+        return true;
+    }
     if (spu_.read16(address, value)) {
         setFault(fault, MemoryFault::None);
         return true;
@@ -350,20 +367,9 @@ bool System::read16(uint32_t address, uint16_t& value, MemoryFault* fault) {
 }
 
 bool System::read32(uint32_t address, uint32_t& value, MemoryFault* fault) {
-    if (address >= 0x1F801050u && address <= 0x1F80105Fu) {
-        uint8_t b = 0;
-        if (address == 0x1F801050u) {
-            if (sioState_ == 1) b = 0xFFu;
-            else if (sioState_ == 2) {
-                if (sioReadIndex_ == 0) b = 0x5Au;
-                else if (sioReadIndex_ == 1) b = static_cast<uint8_t>(padButtons() & 0xFFu);
-                else if (sioReadIndex_ == 2) b = static_cast<uint8_t>((padButtons() >> 8) & 0xFFu);
-                else b = 0x00u;
-                ++sioReadIndex_;
-                if (sioReadIndex_ >= 5) { sioState_ = 0; sioReadIndex_ = 0; }
-            } else b = 0xFFu;
-        } else if (address == 0x1F801054u) b = 0x05u;
-        value = b;
+    if (traceIo(address)) { std::fprintf(stderr, "[IO] R %08X size=%zu\n", address, sizeof(value)); }
+    if (sio0_.handles(address)) {
+        sio0_.read32(address, value);
         setFault(fault, MemoryFault::None);
         return true;
     }
@@ -387,13 +393,9 @@ bool System::read32(uint32_t address, uint32_t& value, MemoryFault* fault) {
 }
 
 bool System::write8(uint32_t address, uint8_t value, MemoryFault* fault) {
-    if (address >= 0x1F801050u && address <= 0x1F80105Fu) {
-        if (address == 0x1F801050u) {
-            
-            if (value == 0x01u) { sioState_ = 1; sioReadIndex_ = 0; }
-            else if (sioState_ == 1 && value == 0x42u) { sioState_ = 2; sioReadIndex_ = 0; }
-            else { sioState_ = 0; sioReadIndex_ = 0; }
-        }
+    if (traceIo(address)) { std::fprintf(stderr, "[IO] W %08X size=%zu value=%08X\n", address, sizeof(value), static_cast<unsigned>(value)); }
+    if (sio0_.handles(address)) {
+        sio0_.write8(address, value);
         setFault(fault, MemoryFault::None);
         return true;
     }
@@ -412,6 +414,12 @@ bool System::write8(uint32_t address, uint8_t value, MemoryFault* fault) {
 }
 
 bool System::write16(uint32_t address, uint16_t value, MemoryFault* fault) {
+    if (traceIo(address)) { std::fprintf(stderr, "[IO] W %08X size=%zu value=%08X\n", address, sizeof(value), static_cast<unsigned>(value)); }
+    if (sio0_.handles(address)) {
+        sio0_.write16(address, value);
+        setFault(fault, MemoryFault::None);
+        return true;
+    }
     if (spu_.write16(address, value)) {
         setFault(fault, MemoryFault::None);
         return true;
@@ -426,13 +434,9 @@ bool System::write16(uint32_t address, uint16_t value, MemoryFault* fault) {
 }
 
 bool System::write32(uint32_t address, uint32_t value, MemoryFault* fault) {
-    if (address >= 0x1F801050u && address <= 0x1F80105Fu) {
-        if (address == 0x1F801050u) {
-            uint8_t v = static_cast<uint8_t>(value & 0xFFu);
-            if (v == 0x01u) { sioState_ = 1; sioReadIndex_ = 0; }
-            else if (sioState_ == 1 && v == 0x42u) { sioState_ = 2; sioReadIndex_ = 0; }
-            else { sioState_ = 0; sioReadIndex_ = 0; }
-        }
+    if (traceIo(address)) { std::fprintf(stderr, "[IO] W %08X size=%zu value=%08X\n", address, sizeof(value), static_cast<unsigned>(value)); }
+    if (sio0_.handles(address)) {
+        sio0_.write32(address, value);
         setFault(fault, MemoryFault::None);
         return true;
     }

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "psxreborn/memcard.hpp"
 #include "psxreborn/memory.hpp"
 
 namespace psxreborn {
@@ -24,12 +25,20 @@ public:
     void install();
     void attachDisc(const CdImage* disc) { disc_ = disc; }
     void setPadButtons(uint16_t buttons);
+    void setPadSticks(uint8_t leftX, uint8_t leftY, uint8_t rightX, uint8_t rightY);
     uint16_t padButtons() const;
 
     void handleVBlank();
     void handleCdromInterrupt(uint8_t interrupt);
 
 private:
+    struct SavedCpuState {
+        std::array<uint32_t, 32> regs{};
+        uint32_t pc = 0;
+        uint32_t hi = 0;
+        uint32_t lo = 0;
+    };
+
     struct Event {
         uint32_t classId = 0;
         uint32_t specId = 0;
@@ -51,6 +60,11 @@ private:
         bool used = false;
         std::vector<uint8_t> data;
         size_t position = 0;
+        bool card = false;
+        MemoryCard* cardPtr = nullptr;
+        std::string cardName;
+        uint32_t cardSize = 0;
+        bool writable = false;
     };
 
     bool onInstruction(uint32_t pc);
@@ -59,6 +73,14 @@ private:
     void handleIrq();
     void enterEntryInt();
     void leaveEntryInt();
+    void startIntRpChain();
+    void beginIntRpCall(uint32_t function, bool second);
+    void finishIntRpCall();
+    void advanceIntRpChain();
+    void finishIntRpChain();
+    void abortIntRpChain();
+    void saveCpuState(SavedCpuState& state) const;
+    void restoreCpuState(const SavedCpuState& state);
 
     void a0Call(uint8_t function);
     void b0Call(uint8_t function);
@@ -73,6 +95,14 @@ private:
     void writeString(uint32_t address, const std::string& value);
 
     uint32_t openFile(const std::string& path, uint32_t mode);
+    MemoryCard* cardForPath(const std::string& path, unsigned& slot, std::string& name) const;
+    uint32_t cardFirstFile(const std::string& path, uint32_t direntry);
+    uint32_t cardNextFile(uint32_t direntry);
+    uint32_t writeDirectoryEntry(uint32_t address, const MemoryCardFileInfo& info);
+    uint32_t openCardByFcb(uint32_t fcb, const std::string& path, uint32_t mode);
+    uint32_t cardFcbFd(uint32_t fcb) const;
+    bool persistCard(MemoryCard* card);
+    void cardFormat(MemoryCard* card);
     uint32_t readFile(uint32_t fd, uint32_t address, uint32_t size);
     uint32_t writeFile(uint32_t fd, uint32_t address, uint32_t size);
     uint32_t seekFile(uint32_t fd, int32_t offset, uint32_t whence);
@@ -114,25 +144,33 @@ private:
     bool installed_ = false;
     uint32_t randState_ = 1;
 
+    std::map<uint32_t, uint32_t> cardFcb_;
+    std::vector<MemoryCardFileInfo> cardSearch_;
+    size_t cardSearchIndex_ = 0;
+    unsigned cardSearchSlot_ = 0;
+
     uint32_t padBuf1_ = 0;
     uint32_t padBuf2_ = 0;
     bool padEnabled_ = false;
+    bool padAutoAck_ = false;
+    std::array<bool, 4> rootCounterAutoAck_{};
 
     static constexpr uint32_t kEntryIntReturn = 0xFFFFFFFFu;
+    static constexpr uint32_t kIntRpReturn = 0xFFFFFFFEu;
     static constexpr uint32_t kEntryIntFrameSize = 0x30u;
-
-    struct SavedCpuState {
-        std::array<uint32_t, 32> regs{};
-        uint32_t pc = 0;
-        uint32_t hi = 0;
-        uint32_t lo = 0;
-    };
 
     uint32_t entryInt_ = 0;
     bool inEntryInt_ = false;
     bool inBiosCall_ = false;
     bool returnFromException_ = false;
     SavedCpuState savedState_{};
+
+    std::array<uint32_t, 4> intRpChains_{};
+    bool inIntRp_ = false;
+    bool intRpSecond_ = false;
+    bool intRpAborted_ = false;
+    uint32_t intRpPriority_ = 0;
+    uint32_t intRpElement_ = 0;
 };
 
 }  // namespace psxreborn

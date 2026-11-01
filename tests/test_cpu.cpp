@@ -367,6 +367,19 @@ TEST_CASE(cpu_stops_on_step_limit_break_and_syscall) {
     }
 }
 
+TEST_CASE(cpu_cycle_callback_uses_instruction_cycle_bias) {
+    Memory memory;
+    Cpu cpu(memory);
+    uint64_t cycles = 0;
+    cpu.setCycleCallback([&cycles](uint32_t value) { cycles += value; });
+    test::writeProgram(memory, kProgramBase, {kNop, kNop, kNop, kBreak});
+    cpu.reset();
+    cpu.setPc(kProgramBase);
+    const psxreborn::CpuRunResult result = cpu.run(16);
+    CHECK_EQ(result.steps, static_cast<uint64_t>(3));
+    CHECK_EQ(cycles, static_cast<uint64_t>(3 * psxreborn::kCyclesPerInstruction));
+}
+
 TEST_CASE(cpu_reports_alignment_bus_and_fetch_errors) {
     {
         Memory memory;

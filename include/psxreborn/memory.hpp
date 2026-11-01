@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace psxreborn {
@@ -31,6 +32,13 @@ public:
 
     void reset();
     void setIoDevice(IoDevice* device) { ioDevice_ = device; }
+    void setWriteObserver(std::function<void(uint32_t, size_t)> observer) {
+        writeObserver_ = std::move(observer);
+    }
+    uint8_t* ramData() { return ram_.data(); }
+    const uint8_t* ramData() const { return ram_.data(); }
+    uint8_t* scratchpadData() { return scratchpad_.data(); }
+    const uint8_t* scratchpadData() const { return scratchpad_.data(); }
 
     bool read8(uint32_t address, uint8_t& value, MemoryFault* fault = nullptr) const;
     bool read16(uint32_t address, uint16_t& value, MemoryFault* fault = nullptr) const;
@@ -68,6 +76,7 @@ private:
     std::vector<uint8_t> scratchpad_;
     std::vector<uint8_t> bios_;
     IoDevice* ioDevice_ = nullptr;
+    std::function<void(uint32_t, size_t)> writeObserver_;
 };
 
 const char* toString(MemoryFault fault);

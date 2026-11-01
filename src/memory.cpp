@@ -84,7 +84,7 @@ bool Memory::read8(uint32_t address, uint8_t& value, MemoryFault* fault) const {
             return true;
         case Region::Io:
             if (ioDevice_ != nullptr) {
-                return ioDevice_->read8(address, value, fault);
+                return ioDevice_->read8(address & 0x1FFFFFFFu, value, fault);
             }
             setFault(fault, MemoryFault::Unsupported);
             return false;
@@ -107,7 +107,7 @@ bool Memory::read16(uint32_t address, uint16_t& value, MemoryFault* fault) const
     const Mapping mapping = map(address);
     if (mapping.region == Region::Io) {
         if (ioDevice_ != nullptr) {
-            return ioDevice_->read16(address, value, fault);
+            return ioDevice_->read16(address & 0x1FFFFFFFu, value, fault);
         }
         setFault(fault, MemoryFault::Unsupported);
         return false;
@@ -152,7 +152,7 @@ bool Memory::read32(uint32_t address, uint32_t& value, MemoryFault* fault) const
     const Mapping mapping = map(address);
     if (mapping.region == Region::Io) {
         if (ioDevice_ != nullptr) {
-            return ioDevice_->read32(address, value, fault);
+            return ioDevice_->read32(address & 0x1FFFFFFFu, value, fault);
         }
         setFault(fault, MemoryFault::Unsupported);
         return false;
@@ -195,6 +195,9 @@ bool Memory::write8(uint32_t address, uint8_t value, MemoryFault* fault) {
     switch (mapping.region) {
         case Region::Ram:
             ram_[mapping.offset] = value;
+            if (writeObserver_) {
+                writeObserver_(address, 1);
+            }
             setFault(fault, MemoryFault::None);
             return true;
         case Region::Scratchpad:
@@ -206,7 +209,7 @@ bool Memory::write8(uint32_t address, uint8_t value, MemoryFault* fault) {
             return false;
         case Region::Io:
             if (ioDevice_ != nullptr) {
-                return ioDevice_->write8(address, value, fault);
+                return ioDevice_->write8(address & 0x1FFFFFFFu, value, fault);
             }
             setFault(fault, MemoryFault::Unsupported);
             return false;
@@ -229,7 +232,7 @@ bool Memory::write16(uint32_t address, uint16_t value, MemoryFault* fault) {
     const Mapping mapping = map(address);
     if (mapping.region == Region::Io) {
         if (ioDevice_ != nullptr) {
-            return ioDevice_->write16(address, value, fault);
+            return ioDevice_->write16(address & 0x1FFFFFFFu, value, fault);
         }
         setFault(fault, MemoryFault::Unsupported);
         return false;
@@ -244,6 +247,9 @@ bool Memory::write16(uint32_t address, uint16_t value, MemoryFault* fault) {
                                    : scratchpad_.data() + mapping.offset;
         destination[0] = static_cast<uint8_t>(value & 0xFFu);
         destination[1] = static_cast<uint8_t>((value >> 8) & 0xFFu);
+        if (mapping.region == Region::Ram && writeObserver_) {
+            writeObserver_(address, 2);
+        }
         setFault(fault, MemoryFault::None);
         return true;
     }
@@ -265,7 +271,7 @@ bool Memory::write32(uint32_t address, uint32_t value, MemoryFault* fault) {
     const Mapping mapping = map(address);
     if (mapping.region == Region::Io) {
         if (ioDevice_ != nullptr) {
-            return ioDevice_->write32(address, value, fault);
+            return ioDevice_->write32(address & 0x1FFFFFFFu, value, fault);
         }
         setFault(fault, MemoryFault::Unsupported);
         return false;
@@ -282,6 +288,9 @@ bool Memory::write32(uint32_t address, uint32_t value, MemoryFault* fault) {
         destination[1] = static_cast<uint8_t>((value >> 8) & 0xFFu);
         destination[2] = static_cast<uint8_t>((value >> 16) & 0xFFu);
         destination[3] = static_cast<uint8_t>((value >> 24) & 0xFFu);
+        if (mapping.region == Region::Ram && writeObserver_) {
+            writeObserver_(address, 4);
+        }
         setFault(fault, MemoryFault::None);
         return true;
     }

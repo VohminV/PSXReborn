@@ -15,6 +15,23 @@ constexpr uint32_t kBreak = 0x0000000Du;
 
 }  // namespace
 
+TEST_CASE(sio1_registers_are_not_a_controller_port) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+    system.setPadButtons(0xFFFFu & ~0x4000u);
+
+    CHECK(memory.write8(0x1F801050u, 0x01u));
+    CHECK(memory.write8(0x1F801050u, 0x42u));
+    uint8_t data = 0;
+    CHECK(memory.read8(0x1F801050u, data));
+    CHECK_EQ(data, 0x42u);
+
+    uint16_t status = 0xFFFFu;
+    CHECK(memory.read16(0x1F801054u, status));
+    CHECK_EQ(status, 0u);
+}
+
 TEST_CASE(interrupts_mask_status_and_acknowledge) {
     Memory memory;
     System system(memory);
@@ -131,7 +148,7 @@ TEST_CASE(cpu_timer_callback_advances_time) {
     system.bind(cpu);
     const CpuRunResult result = cpu.run(2);
     CHECK_EQ(static_cast<unsigned>(result.reason), static_cast<unsigned>(CpuStopReason::StepLimit));
-    CHECK_EQ(system.timers().count(0), 2u);
+    CHECK_EQ(system.timers().count(0), static_cast<uint16_t>(2u * kCyclesPerInstruction));
 }
 
 TEST_CASE(io_subword_access_reads_interrupt_registers) {
@@ -157,22 +174,26 @@ TEST_CASE(gpu_fill_and_cpu_vram_transfer) {
     CHECK(memory.write32(Gpu::kGp0Address, 0x00000000u));
     CHECK(memory.write32(Gpu::kGp0Address, 0x00030003u));
     CHECK_EQ(system.gpu().vram(0, 0), 0x001Fu);
-    CHECK_EQ(system.gpu().vram(3, 3), 0x001Fu);
-    CHECK_EQ(system.gpu().vram(4, 4), 0x0000u);
+    CHECK_EQ(system.gpu().vram(15, 0), 0x001Fu);
+    CHECK_EQ(system.gpu().vram(0, 2), 0x001Fu);
+    CHECK_EQ(system.gpu().vram(15, 2), 0x001Fu);
+    CHECK_EQ(system.gpu().vram(0, 3), 0x0000u);
+    CHECK_EQ(system.gpu().vram(16, 0), 0x0000u);
 
     CHECK(memory.write32(Gpu::kGp0Address, 0xA0000000u));
     CHECK(memory.write32(Gpu::kGp0Address, 0x00080010u));
-    CHECK(memory.write32(Gpu::kGp0Address, 0x00010001u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00020002u));
     CHECK(memory.write32(Gpu::kGp0Address, 0x7C1F03E0u));
     CHECK(memory.write32(Gpu::kGp0Address, 0x00007C1Fu));
     CHECK_EQ(system.gpu().vram(16, 8), 0x03E0u);
     CHECK_EQ(system.gpu().vram(17, 8), 0x7C1Fu);
+    CHECK_EQ(system.gpu().vram(18, 8), 0x0000u);
     CHECK_EQ(system.gpu().vram(16, 9), 0x7C1Fu);
     CHECK_EQ(system.gpu().vram(17, 9), 0x0000u);
 
     CHECK(memory.write32(Gpu::kGp0Address, 0xC0000000u));
     CHECK(memory.write32(Gpu::kGp0Address, 0x00080010u));
-    CHECK(memory.write32(Gpu::kGp0Address, 0x00010001u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00020002u));
     uint32_t value = 0;
     CHECK(memory.read32(Gpu::kGp0Address, value));
     CHECK_EQ(value, 0x7C1F03E0u);
@@ -180,6 +201,24 @@ TEST_CASE(gpu_fill_and_cpu_vram_transfer) {
     CHECK_EQ(value, 0x00007C1Fu);
     CHECK(memory.read32(Gpu::kGp0Address, value));
     CHECK_EQ(value, 0u);
+}
+
+TEST_CASE(gpu_cpu_to_vram_transfer_row_alignment) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0xA0000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00080010u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00020003u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x23451234u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x45673456u));
+    CHECK_EQ(system.gpu().vram(16, 8), 0x1234u);
+    CHECK_EQ(system.gpu().vram(17, 8), 0x2345u);
+    CHECK_EQ(system.gpu().vram(18, 8), 0x3456u);
+    CHECK_EQ(system.gpu().vram(19, 8), 0x0000u);
+    CHECK_EQ(system.gpu().vram(16, 9), 0x4567u);
+    CHECK_EQ(system.gpu().vram(17, 9), 0x0000u);
 }
 
 TEST_CASE(gpu_rectangle_uses_drawing_area_and_offset) {
@@ -223,6 +262,317 @@ TEST_CASE(gpu_flat_triangle_and_status) {
     CHECK_EQ(system.gpu().vram(0, 0), 0x001Fu);
     CHECK_EQ(system.gpu().vram(5, 1), 0x001Fu);
     CHECK_EQ(system.gpu().vram(15, 15), 0x0000u);
+}
+
+TEST_CASE(gpu_textured_polygon_clut_and_texpage) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u | 2u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0xA0000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00040000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00010004u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x1312u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x0u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0xA0000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00040080u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00010002u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x66666666u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0xA0000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00050000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00010008u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x22221111u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x44443333u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x77777777u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x77777777u));
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0x250000FFu));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x01400401u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00000003u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00000404u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00030000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00000405u));
+
+    CHECK_EQ(system.gpu().vram(1, 5), 0x2222u);
+    CHECK_EQ(system.gpu().vram(0, 0), 0x2222u);
+    CHECK_EQ(system.gpu().vram(1, 0), 0x4444u);
+}
+
+TEST_CASE(gpu_texture_window_masking) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u | (2u << 7)));
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE2000000u | 31u | (1u << 10)));
+    CHECK(memory.write32(Gpu::kGp0Address, 0xA0000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00010010u));
+    for (uint32_t word = 0; word < 8u; ++word) {
+        const uint32_t low = (0x0100u + word * 2u + 1u);
+        const uint32_t high = (0x0100u + word * 2u + 2u);
+        CHECK(memory.write32(Gpu::kGp0Address, (high << 16) | low));
+    }
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0x65000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00100010u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00100010u));
+    CHECK_EQ(system.gpu().vram(16, 16), 0x0109u);
+    CHECK_EQ(system.gpu().vram(23, 16), 0x0110u);
+    CHECK_EQ(system.gpu().vram(24, 16), 0x0109u);
+    CHECK_EQ(system.gpu().vram(16, 17), 0x0000u);
+}
+
+TEST_CASE(gpu_textured_rect_clut4_texel_packing) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+    Gpu& gpu = system.gpu();
+
+    for (uint32_t index = 0; index < 16u; ++index) {
+        gpu.setVram(16u + index, 6u, static_cast<uint16_t>(0x0100u + index));
+    }
+    for (uint32_t row = 0; row < 4u; ++row) {
+        for (uint32_t column = 0; column < 8u; ++column) {
+            uint16_t word = 0;
+            for (uint32_t texel = 0; texel < 4u; ++texel) {
+                word = static_cast<uint16_t>(
+                    word | ((((column * 4u + texel) & 0xFu) & 0xFu) << (texel * 4u)));
+            }
+            gpu.setVram(column, row, word);
+        }
+    }
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x65000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, (100u << 16) | 100u));
+    CHECK(memory.write32(Gpu::kGp0Address, ((6u << 6) | 1u) << 16));
+    CHECK(memory.write32(Gpu::kGp0Address, (4u << 16) | 8u));
+
+    for (uint32_t row = 0; row < 4u; ++row) {
+        for (uint32_t column = 0; column < 8u; ++column) {
+            CHECK_EQ(gpu.vram(100u + column, 100u + row), static_cast<uint16_t>(0x0100u + column));
+        }
+    }
+    CHECK_EQ(gpu.vram(100u, 99u), 0x0000u);
+    CHECK_EQ(gpu.vram(108u, 100u), 0x0000u);
+}
+
+TEST_CASE(gpu_textured_rect_clut8_byte_packing) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+    Gpu& gpu = system.gpu();
+
+    for (uint32_t index = 0; index < 256u; ++index) {
+        gpu.setVram(32u + index, 6u, static_cast<uint16_t>(0x0200u + index));
+    }
+    for (uint32_t row = 0; row < 4u; ++row) {
+        for (uint32_t column = 0; column < 8u; ++column) {
+            const uint16_t low = static_cast<uint16_t>(column * 2u + row * 8u);
+            const uint16_t high = static_cast<uint16_t>(column * 2u + 1u + row * 8u);
+            gpu.setVram(column, row, static_cast<uint16_t>(low | (high << 8)));
+        }
+    }
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u | (1u << 7)));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x65000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, (100u << 16) | 100u));
+    CHECK(memory.write32(Gpu::kGp0Address, ((6u << 6) | 2u) << 16));
+    CHECK(memory.write32(Gpu::kGp0Address, (4u << 16) | 8u));
+
+    for (uint32_t row = 0; row < 4u; ++row) {
+        for (uint32_t column = 0; column < 8u; ++column) {
+            const uint16_t expected =
+                static_cast<uint16_t>(0x0200u + column + row * 8u);
+            CHECK_EQ(gpu.vram(100u + column, 100u + row), expected);
+        }
+    }
+    CHECK_EQ(gpu.vram(108u, 100u), 0x0000u);
+}
+
+TEST_CASE(gpu_textured_rect_texture_window_with_clut4) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+    Gpu& gpu = system.gpu();
+
+    for (uint32_t index = 0; index < 16u; ++index) {
+        gpu.setVram(16u + index, 6u, static_cast<uint16_t>(0x0100u + index));
+    }
+    for (uint32_t row = 0; row < 8u; ++row) {
+        for (uint32_t column = 0; column < 8u; ++column) {
+            uint16_t word = 0;
+            for (uint32_t texel = 0; texel < 4u; ++texel) {
+                const uint16_t palette =
+                    static_cast<uint16_t>((column * 4u + texel + row * 2u) & 0xFu);
+                word = static_cast<uint16_t>(word | (palette << (texel * 4u)));
+            }
+            gpu.setVram(column, row, word);
+        }
+    }
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u));
+    CHECK(memory.write32(Gpu::kGp0Address,
+                         0xE2000000u | 1u | (31u << 5) | (1u << 10)));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x65000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, (100u << 16) | 100u));
+    CHECK(memory.write32(Gpu::kGp0Address, ((6u << 6) | 1u) << 16));
+    CHECK(memory.write32(Gpu::kGp0Address, (12u << 16) | 8u));
+
+    for (uint32_t row = 0; row < 12u; ++row) {
+        for (uint32_t column = 0; column < 8u; ++column) {
+            const uint16_t sourceRow = row & 7u;
+            const uint32_t sourceTexel = (column | 8u) + sourceRow * 2u;
+            const uint16_t expected =
+                static_cast<uint16_t>(0x0100u + (sourceTexel & 0xFu));
+            CHECK_EQ(gpu.vram(100u + column, 100u + row), expected);
+        }
+    }
+    CHECK_EQ(gpu.vram(100u, 112u), 0x0000u);
+}
+
+TEST_CASE(gpu_modulation_texel_color) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+    Gpu& gpu = system.gpu();
+
+    gpu.setVram(16u, 6u, 0x7FFFu);
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x64404040u));
+    CHECK(memory.write32(Gpu::kGp0Address, (100u << 16) | 100u));
+    CHECK(memory.write32(Gpu::kGp0Address, ((6u << 6) | 1u) << 16));
+    CHECK(memory.write32(Gpu::kGp0Address, (1u << 16) | 1u));
+    CHECK_EQ(gpu.vram(100u, 100u), 0x3DEFu);
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0x6520A040u));
+    CHECK(memory.write32(Gpu::kGp0Address, 110u | (100u << 16)));
+    CHECK(memory.write32(Gpu::kGp0Address, ((6u << 6) | 1u) << 16));
+    CHECK(memory.write32(Gpu::kGp0Address, (1u << 16) | 1u));
+    CHECK_EQ(gpu.vram(110u, 100u), 0x7FFFu);
+}
+
+TEST_CASE(gpu_semi_transparency_blend_modes) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+    Gpu& gpu = system.gpu();
+
+    gpu.setVram(100u, 100u, 0x7C1Fu);
+    CHECK(memory.write32(Gpu::kGp0Address, 0x620000FFu));
+    CHECK(memory.write32(Gpu::kGp0Address, 100u | (100u << 16)));
+    CHECK(memory.write32(Gpu::kGp0Address, (1u << 16) | 1u));
+    CHECK_EQ(gpu.vram(100u, 100u), 0x3C1Fu);
+
+    gpu.setVram(101u, 100u, 0x7C1Fu);
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u | (1u << 5)));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x62004000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 101u | (100u << 16)));
+    CHECK(memory.write32(Gpu::kGp0Address, (1u << 16) | 1u));
+    CHECK_EQ(gpu.vram(101u, 100u), 0x7D1Fu);
+
+    gpu.setVram(102u, 100u, 0x7C1Fu);
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u | (2u << 5)));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x620000FFu));
+    CHECK(memory.write32(Gpu::kGp0Address, 102u | (100u << 16)));
+    CHECK(memory.write32(Gpu::kGp0Address, (1u << 16) | 1u));
+    CHECK_EQ(gpu.vram(102u, 100u), 0x7C00u);
+
+    gpu.setVram(103u, 100u, 0x01E0u);
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u | (3u << 5)));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x62FFFFFFu));
+    CHECK(memory.write32(Gpu::kGp0Address, 103u | (100u << 16)));
+    CHECK(memory.write32(Gpu::kGp0Address, (1u << 16) | 1u));
+    CHECK_EQ(gpu.vram(103u, 100u), 0x1EC7u);
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u));
+    gpu.setVram(104u, 100u, 0x7C1Fu);
+    CHECK(memory.write32(Gpu::kGp0Address, 0x600000FFu));
+    CHECK(memory.write32(Gpu::kGp0Address, 104u | (100u << 16)));
+    CHECK(memory.write32(Gpu::kGp0Address, (1u << 16) | 1u));
+    CHECK_EQ(gpu.vram(104u, 100u), 0x001Fu);
+}
+
+TEST_CASE(gpu_semi_transparency_clut_stp_flag) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+    Gpu& gpu = system.gpu();
+
+    gpu.setVram(16u + 0u, 6u, 0x801Fu);
+    gpu.setVram(16u + 1u, 6u, 0x001Fu);
+    gpu.setVram(16u + 2u, 6u, 0x8000u);
+    gpu.setVram(0u, 0u, 0x0001u);
+    gpu.setVram(1u, 0u, 0x0002u);
+
+    gpu.setVram(100u, 100u, 0x7C1Fu);
+    gpu.setVram(101u, 100u, 0x7C1Fu);
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x67000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, (100u << 16) | 100u));
+    CHECK(memory.write32(Gpu::kGp0Address, ((6u << 6) | 1u) << 16));
+    CHECK(memory.write32(Gpu::kGp0Address, (1u << 16) | 2u));
+
+    CHECK_EQ(gpu.vram(100u, 100u), 0x001Fu);
+    CHECK_EQ(gpu.vram(101u, 100u), 0xBC1Fu);
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u | (1u << 12)));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x65000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 200u | (100u << 16)));
+    CHECK(memory.write32(Gpu::kGp0Address, ((6u << 6) | 1u) << 16 | 4u));
+    CHECK(memory.write32(Gpu::kGp0Address, (1u << 16) | 1u));
+
+    CHECK_EQ(gpu.vram(200u, 100u), 0x8000u);
+}
+
+TEST_CASE(gpu_textured_rect_x_flip) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+    Gpu& gpu = system.gpu();
+
+    for (uint32_t index = 0; index < 16u; ++index) {
+        gpu.setVram(16u + index, 6u, static_cast<uint16_t>(0x0100u + index));
+    }
+    gpu.setVram(0u, 0u, 0x3210u);
+    gpu.setVram(1u, 0u, 0x7654u);
+    gpu.setVram(2u, 0u, 0xBA98u);
+    gpu.setVram(3u, 0u, 0xFEDCu);
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0xE1000000u | (1u << 12)));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x65000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, (100u << 16) | 100u));
+    CHECK(memory.write32(Gpu::kGp0Address, 7u | ((6u << 6) | 1u) << 16));
+    CHECK(memory.write32(Gpu::kGp0Address, (1u << 16) | 8u));
+
+    CHECK_EQ(gpu.vram(100u, 100u), 0x0107u);
+    CHECK_EQ(gpu.vram(101u, 100u), 0x0106u);
+    CHECK_EQ(gpu.vram(106u, 100u), 0x0101u);
+    CHECK_EQ(gpu.vram(107u, 100u), 0x0100u);
+}
+
+TEST_CASE(gpu_gouraud_shaded_triangle) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+
+    CHECK(memory.write32(Gpu::kGp0Address, 0x300000FFu));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00000008u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00000000u));
+    CHECK(memory.write32(Gpu::kGp0Address, 0x00080000u));
+
+    CHECK_EQ(system.gpu().vram(0u, 0u), 0x001Fu);
+    CHECK_EQ(system.gpu().vram(4u, 0u), 0x000Fu);
+    CHECK_EQ(system.gpu().vram(8u, 0u), 0x0000u);
+    CHECK_EQ(system.gpu().vram(0u, 8u), 0x0000u);
+    CHECK_EQ(system.gpu().vram(4u, 1u), 0x000Bu);
 }
 
 TEST_CASE(gpu_gp1_info_and_display_control) {
@@ -304,15 +654,15 @@ TEST_CASE(dma_gpu_linked_list_renders) {
     CHECK(memory.write32(0x80002000u, 0x03FFFFFFu));
     CHECK(memory.write32(0x80002004u, 0x020000FFu));
     CHECK(memory.write32(0x80002008u, 0x00000000u));
-    CHECK(memory.write32(0x8000200Cu, 0x00010001u));
+    CHECK(memory.write32(0x8000200Cu, 0x00020002u));
     CHECK(memory.write32(Dma::kBaseAddress + 2u * 0x10u, 0x80002000u));
     CHECK(memory.write32(Dma::kBaseAddress + 2u * 0x10u + 4u, 0));
     CHECK(memory.write32(Dma::kBaseAddress + 2u * 0x10u + 8u, 0x01000401u));
 
     CHECK(!system.dma().busy(2));
     CHECK_EQ(system.gpu().vram(0, 0), 0x001Fu);
-    CHECK_EQ(system.gpu().vram(1, 1), 0x001Fu);
-    CHECK_EQ(system.gpu().vram(2, 2), 0x0000u);
+    CHECK_EQ(system.gpu().vram(15, 1), 0x001Fu);
+    CHECK_EQ(system.gpu().vram(0, 2), 0x0000u);
 }
 
 TEST_CASE(dma_completion_requests_irq3) {

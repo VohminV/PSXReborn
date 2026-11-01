@@ -134,6 +134,11 @@ int runFile(const std::string& path, uint64_t maxSteps) {
                      image.header.stackBase, image.header.stackOffset);
     const CpuRunResult result = cpu.run(maxSteps);
 
+    if (const char* stats = std::getenv("PSXREBORN_JIT_STATS")) {
+        (void)stats;
+        std::cout << "jit-blocks: " << cpu.jitCompiledBlocks() << "\n";
+        std::cout << "jit-executed: " << cpu.jitExecutedBlocks() << "\n";
+    }
     std::cout << "stop: " << toString(result.reason) << "\n";
     std::cout << "steps: " << result.steps << "\n";
     std::cout << "pc: " << hex32(result.pc) << "\n";
@@ -227,6 +232,9 @@ int bootImage(const std::string& path, uint64_t maxSteps) {
     system.cdrom().attachDisc(&*disc);
     bios.install();
     cpu.setExecutionMode(CpuExecutionMode::Hardware);
+    if (const char* jit = std::getenv("PSXREBORN_JIT")) {
+        cpu.setJitEnabled(jit[0] != '0');
+    }
 
     uint32_t stackBase = image.header.stackBase;
     uint32_t stackOffset = image.header.stackOffset;
@@ -238,6 +246,12 @@ int bootImage(const std::string& path, uint64_t maxSteps) {
         }
     }
     cpu.resetFromExe(image.header.entryPoint, image.header.globalPointer, stackBase, stackOffset);
+    if (const char* jit = std::getenv("PSXREBORN_JIT")) {
+        cpu.setJitEnabled(jit[0] != '0');
+    }
+    if (const char* pad = std::getenv("PSXREBORN_PAD")) {
+        system.setPadButtons(static_cast<uint16_t>(std::strtoul(pad, nullptr, 16)));
+    }
 
     cpu.setCycleCallback([&](uint32_t cycles){
         system.tick(cycles);
@@ -247,6 +261,9 @@ int bootImage(const std::string& path, uint64_t maxSteps) {
     const char* pcLog = std::getenv("PSXREBORN_PC_LOG");
     do {
         const uint64_t budget = std::min<uint64_t>(maxSteps - executedSteps, 100000u);
+        if (std::getenv("PSXREBORN_PC_TRACE") != nullptr) {
+            std::cerr << "[CHUNK] base=" << executedSteps << " budget=" << budget << "\n";
+        }
         result = cpu.run(budget);
         executedSteps += result.steps;
         if (pcLog != nullptr) {
@@ -302,6 +319,11 @@ int bootImage(const std::string& path, uint64_t maxSteps) {
         }
     }
 
+    if (const char* stats = std::getenv("PSXREBORN_JIT_STATS")) {
+        (void)stats;
+        std::cout << "jit-blocks: " << cpu.jitCompiledBlocks() << "\n";
+        std::cout << "jit-executed: " << cpu.jitExecutedBlocks() << "\n";
+    }
     std::cout << "stop: " << toString(result.reason) << "\n";
     std::cout << "steps: " << result.steps << "\n";
     std::cout << "pc: " << hex32(result.pc) << "\n";

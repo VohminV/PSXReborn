@@ -1,5 +1,10 @@
 #include "psxreborn/cpu.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
+#include "psxreborn/jit.hpp"
+
 #include <limits>
 
 namespace psxreborn {
@@ -39,6 +44,53 @@ void Cpu::resetFromExe(uint32_t entryPoint, uint32_t globalPointer, uint32_t sta
     }
     regs_[4] = 1;
     regs_[5] = 0;
+}
+
+Cpu::~Cpu() = default;
+
+void Cpu::setJitEnabled(bool enabled) {
+    if (enabled && !jit_) {
+        jit_ = std::make_unique<Jit>(*this, memory_);
+    }
+    jitEnabled_ = enabled;
+    if (enabled && jit_) {
+        jit_->invalidateAll();
+    }
+}
+
+uint64_t Cpu::jitCompiledBlocks() const {
+    return jit_ ? jit_->compiledBlocks() : 0;
+}
+
+uint64_t Cpu::jitExecutedBlocks() const {
+    return jit_ ? jit_->executedBlocks() : 0;
+}
+
+CpuJitState Cpu::jitState() {
+    CpuJitState state;
+    state.regs = regs_.data();
+    state.pc = &pc_;
+    state.hi = &hi_;
+    state.lo = &lo_;
+    state.cop0 = cop0_.data();
+    state.pendingActive = &pendingLoad_.active;
+    state.pendingReg = &pendingLoad_.reg;
+    state.pendingValue = &pendingLoad_.value;
+    state.pendingMask = &pendingLoad_.mask;
+    state.halted = &halted_;
+    state.gte = &gte_;
+    state.memory = &memory_;
+    return state;
+}
+
+CpuStepResult Cpu::jitMemoryFault(MemoryFault fault, uint32_t pc, uint32_t instruction,
+                                  uint32_t address, bool store, bool inDelaySlot,
+                                  bool branchTaken, uint32_t branchTarget) {
+    pc_ = pc;
+    inDelaySlot_ = inDelaySlot;
+    branchTaken_ = branchTaken;
+    branchTarget_ = branchTarget;
+    return memoryFault(fault, pc, instruction, address, store);
 }
 
 uint32_t Cpu::reg(uint8_t index) const {
@@ -108,6 +160,15 @@ bool Cpu::interruptPending() const {
     return (cop0_[12] & 1u) != 0 && (cop0_[12] & cop0_[13] & 0xFF00u) != 0;
 }
 
+bool Cpu::pollInterrupt() {
+    syncInterruptCause();
+    if (executionMode_ == CpuExecutionMode::Hardware && interruptPending()) {
+        raiseException(CpuException::Interrupt);
+        return true;
+    }
+    return false;
+}
+
 void Cpu::rfe() {
     const uint32_t status = cop0_[12];
     cop0_[12] = (status & ~0x0000000Fu) | ((status & 0x0000003Cu) >> 2);
@@ -117,6 +178,10 @@ void Cpu::rfe() {
 void Cpu::raiseException(CpuException exception, uint32_t badAddress, uint8_t coprocessor) {
     if (exception == CpuException::AddressLoad || exception == CpuException::AddressStore) {
         cop0_[8] = badAddress;
+    }
+    ++stats_.exceptions[static_cast<unsigned>(exception) & 0xFu];
+    if (exception == CpuException::Interrupt) {
+        ++stats_.interruptExceptions;
     }
     uint32_t cause = cop0_[13] & 0x0000FF00u;
     cause |= static_cast<uint32_t>(exception) << 2;
@@ -130,6 +195,13 @@ void Cpu::raiseException(CpuException exception, uint32_t badAddress, uint8_t co
     }
     cop0_[13] = cause;
     cop0_[14] = inDelaySlot_ ? pc_ - 4u : pc_;
+    static const bool exceptionTrace = std::getenv("PSXREBORN_EXCEPTION_LOG") != nullptr;
+    if (exceptionTrace) {
+        std::fprintf(stderr,
+                     "[EXC] type=%u pc=%08x epc=%08x bad=%08x status=%08x inDelay=%u\n",
+                     static_cast<unsigned>(exception), pc_, cop0_[14], badAddress,
+                     cop0_[12], inDelaySlot_ ? 1u : 0u);
+    }
     const uint32_t status = cop0_[12];
     cop0_[12] = (status & ~0x0000003Fu) | ((status & 0x0000000Fu) << 2);
     pc_ = (status & 0x00400000u) != 0 ? 0xBFC00180u : 0x80000080u;
@@ -208,6 +280,7 @@ CpuStepResult Cpu::step() {
     }
 
     const Instruction instruction = decodeInstruction(raw);
+    softTrace(pc_);
     if (!instruction.valid()) {
         if (executionMode_ == CpuExecutionMode::Hardware) {
             raiseException(CpuException::ReservedInstruction);
@@ -251,15 +324,63 @@ CpuStepResult Cpu::step() {
 }
 
 CpuRunResult Cpu::run(uint64_t maxSteps) {
+    if (jitEnabled_ && jit_ && executionMode_ == CpuExecutionMode::Hardware &&
+        (!instructionHook_ || jitHookCompatible_)) {
+        return jit_->run(maxSteps);
+    }
     uint64_t steps = 0;
+    const bool tracePc = std::getenv("PSXREBORN_PC_TRACE") != nullptr;
+    static const char* trapEnv = std::getenv("PSXREBORN_PC_TRAP");
+    static const uint32_t trapPc = trapEnv != nullptr
+                                       ? static_cast<uint32_t>(std::strtoul(trapEnv, nullptr, 16))
+                                       : 0u;
+    static const char* trapBelowEnv = std::getenv("PSXREBORN_PC_TRAP_BELOW");
+    static const uint32_t trapBelow = trapBelowEnv != nullptr
+                                          ? static_cast<uint32_t>(
+                                                std::strtoul(trapBelowEnv, nullptr, 16))
+                                          : 0u;
+    static const char* sampleEnv = std::getenv("PSXREBORN_PC_SAMPLE");
+    static const uint64_t sampleInterval =
+        sampleEnv != nullptr ? std::strtoull(sampleEnv, nullptr, 10) : 0;
+    static uint32_t pcHistory[8192] = {};
+    static unsigned pcHistoryCount = 0;
+    static unsigned pcHistoryNext = 0;
     while (steps < maxSteps) {
+        if (trapPc != 0 || trapBelow != 0) {
+            pcHistory[pcHistoryNext] = pc_;
+            pcHistoryNext = (pcHistoryNext + 1) % 8192;
+            if (pcHistoryCount < 8192) {
+                ++pcHistoryCount;
+            }
+            if ((trapPc != 0 && pc_ == trapPc) || (trapBelow != 0 && pc_ >= 0x80000000u && pc_ < trapBelow)) {
+                std::fprintf(stderr, "[TRAP] pc=%08x steps=%llu history:\n", pc_,
+                             static_cast<unsigned long long>(steps));
+                for (unsigned index = 0; index < pcHistoryCount; ++index) {
+                    const unsigned slot =
+                        (pcHistoryNext + 8192 - pcHistoryCount + index) % 8192;
+                    std::fprintf(stderr, "  %08x\n", pcHistory[slot]);
+                }
+                for (unsigned index = 1; index < 32; ++index) {
+                    std::fprintf(stderr, "  r%u=%08x\n", index, regs_[index]);
+                }
+                return {CpuStopReason::Breakpoint, steps, pc_, 0, 0};
+            }
+        }
+        if (tracePc) {
+            std::fprintf(stderr, "T %llu %08x\n",
+                         static_cast<unsigned long long>(steps), pc_);
+        }
+        if (sampleInterval != 0 && (steps % sampleInterval) == 0) {
+            std::fprintf(stderr, "[PC] steps=%llu pc=%08x\n",
+                         static_cast<unsigned long long>(steps), pc_);
+        }
         const CpuStepResult result = step();
         if (result.reason != CpuStopReason::None) {
             return {result.reason, steps, result.pc, result.instruction, result.address};
         }
         ++steps;
         if (cycleCallback_) {
-            cycleCallback_(1);
+            cycleCallback_(kCyclesPerInstruction);
         }
     }
     return {CpuStopReason::StepLimit, steps, pc_, 0, 0};
@@ -613,6 +734,12 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
 
         case Opcode::Sb: {
             const uint32_t address = rsValue + immediate;
+            if (const char* t = std::getenv("PSXREBORN_TRACE_SIO_COMPILED");
+                t != nullptr && address >= 0x1F801040u && address < 0x1F801050u) {
+                std::fprintf(stderr, "[CPU] sb pc=0x%08X addr=%08X v=%02X ra=0x%08X\n", pc,
+                             address, static_cast<unsigned>(rtValue & 0xFFu),
+                             reg(31));
+            }
             MemoryFault fault = MemoryFault::None;
             if (!memory_.write8(address, static_cast<uint8_t>(rtValue & 0xFFu), &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, true);
@@ -621,6 +748,24 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
         }
         case Opcode::Sh: {
             const uint32_t address = rsValue + immediate;
+            if (const char* t = std::getenv("PSXREBORN_TRACE_SIO_COMPILED");
+                t != nullptr && address >= 0x1F801040u && address < 0x1F801050u) {
+                std::fprintf(stderr, "[CPU] sh pc=0x%08X addr=%08X v=%04X ra=0x%08X\n", pc,
+                             address, static_cast<unsigned>(rtValue & 0xFFFFu), reg(31));
+                static bool ramDumped = false;
+                if (!ramDumped && pc == 0x8004F654u) {
+                    ramDumped = true;
+                    FILE* dump = std::fopen("/tmp/opencode/sio_ram.bin", "wb");
+                    if (dump != nullptr) {
+                        for (uint32_t base = 0x80000000u; base < 0x80200000u; base += 4) {
+                            uint32_t word = 0;
+                            memory_.read32(base, word, nullptr);
+                            std::fwrite(&word, 1, 4, dump);
+                        }
+                        std::fclose(dump);
+                    }
+                }
+            }
             MemoryFault fault = MemoryFault::None;
             if (!memory_.write16(address, static_cast<uint16_t>(rtValue & 0xFFFFu), &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, true);
@@ -629,6 +774,11 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
         }
         case Opcode::Sw: {
             const uint32_t address = rsValue + immediate;
+            if (const char* t = std::getenv("PSXREBORN_TRACE_SIO_COMPILED");
+                t != nullptr && address >= 0x1F801040u && address < 0x1F801050u) {
+                std::fprintf(stderr, "[CPU] sw pc=0x%08X addr=%08X v=%08X ra=0x%08X\n", pc,
+                             address, rtValue, reg(31));
+            }
             MemoryFault fault = MemoryFault::None;
             if (!memory_.write32(address, rtValue, &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, true);
@@ -822,6 +972,114 @@ const char* toString(CpuStopReason reason) {
             return "already halted";
     }
     return "unknown";
+}
+
+void Cpu::softTrace(uint32_t pc) {
+    static const bool enabled = std::getenv("PSXREBORN_SOFT_TRACE") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    static uint64_t seq = 0;
+    uint32_t phase = 0;
+    uint32_t scratch = 0;
+    auto rd32 = [&](uint32_t a, uint32_t& v) { memory_.read32(a, v, nullptr); };
+    switch (pc) {
+        case 0x8004F048u:
+            rd32(0x80067490u, phase);
+            fprintf(stderr, "[PW] dispatch-in phase=%u seq=%llu\n", phase,
+                    (unsigned long long)(seq++));
+            break;
+        case 0x8004F088u:
+            rd32(0x80067490u, phase);
+            fprintf(stderr, "[PW] dispatch-handler-ret a0=%08X phase=%u\n", reg(4), phase);
+            break;
+        case 0x8004F0C4u:
+            rd32(0x80067490u, phase);
+            fprintf(stderr, "[PW] post-wait phase=%u buffer0=%u\n", phase,
+                    (rd32(0x80067490u, scratch), scratch = 0, 0));
+            break;
+        case 0x8004F0D4u:
+            fprintf(stderr, "[PW] waitack ret v0=%08X\n", reg(2));
+            break;
+        case 0x8004F0E4u:
+            fprintf(stderr, "[PW] deselect-err-fn a0=%08X\n", reg(4));
+            break;
+        case 0x8004F120u:
+            fprintf(stderr, "[PW] deselect-fn a0=%08X ra=%08X\n", reg(4), reg(31));
+            break;
+        case 0x80050A0Cu:
+            fprintf(stderr, "[PW] deselect-enter a0=%08X\n", reg(4));
+            break;
+        case 0x8004F138u:
+            fprintf(stderr, "[PW] startTx s3=%08X (tx=%02X)\n", reg(7), (reg(7) & 0xFFu) ^ 0xFFu);
+            break;
+        case 0x8004F35Cu:
+            fprintf(stderr, "[PW] send-func a0=%08X byte=%02X count=%u\n", reg(4), reg(5),
+                    (rd32(0x80067490u, phase), 0));
+            break;
+        case 0x8004F3BCu: {
+            uint32_t s0 = reg(4);
+            uint32_t count = 0;
+            rd32(0x80067490u, scratch);
+            if (s0 != 0) {
+                uint32_t word = 0;
+                rd32(s0, word);  // struct base: read 0x44 count bytes after
+                memory_.read32((s0 & ~3u) + 0x44, count, nullptr);
+            }
+            fprintf(stderr, "[PW] send-wait-rx s0=%08X count=%02X phase=%u\n", s0, count, scratch);
+            break;
+        }
+        case 0x8004F3E4u: {
+            uint32_t s0 = reg(4);
+            uint32_t count = 0;
+            rd32(0x80067490u, scratch);
+            if (s0 != 0) memory_.read32((s0 & ~3u) + 0x44, count, nullptr);
+            uint32_t joystat = 0;
+            memory_.read32(0x1F801044u, joystat, nullptr);
+            fprintf(stderr, "[PW] send-rx-read count=%02X phase=%u stat=%04X\n", count, scratch,
+                    joystat & 0xFFFFu);
+            break;
+        }
+        case 0x8004F430u:
+            fprintf(stderr, "[PW] send-irq-check-passed (I_STAT bit7 set)\n");
+            break;
+        case 0x8004F438u:
+            fprintf(stderr, "[PW] send-acklevel-wait-enter stat=%04X\n",
+                    ([] { uint32_t v = 0; return v; }()));
+            break;
+        case 0x8004F4C4u:
+            fprintf(stderr, "[PW] send-ack-timeout path (ret fffe) ra=%08X\n", reg(31));
+            break;
+        case 0x8004F5B0u: {
+            uint32_t count = 0;
+            uint32_t word = 0;
+            uint32_t s0 = reg(4);
+            uint32_t buff = 0;
+            if (s0 != 0) rd32(s0 + 0x3C, buff);
+            if (buff) memory_.read32(buff, word, nullptr);
+            memory_.read32((s0 & ~3u) + 0x44, count, nullptr);
+            fprintf(stderr, "[PW] send-func-exit rx=%02X countBefore+1=%02X buf0=%02X\n",
+                    reg(2) & 0xFFu, count, word & 0xFFu);
+            break;
+        }
+        case 0x80050234u:
+            fprintf(stderr, "[PW] phase2-id-rx v0=%08X\n", reg(2));
+            break;
+        case 0x80050304u:
+            fprintf(stderr, "[PW] phase3-id-rx v1=%08X\n", reg(3));
+            break;
+        case 0x8004F160u:
+            fprintf(stderr, "[PW] startTx-len-set\n");
+            break;
+        case 0x8004F1B8u:
+            fprintf(stderr, "[PW] startTx-stat-wait stat=%04X\n",
+                    ([&] { uint32_t v = 0; memory_.read32(0x1F801044u, v, nullptr); return v; }()));
+            break;
+        case 0x80050008u:
+            break;
+        default:
+            break;
+    }
 }
 
 }  // namespace psxreborn

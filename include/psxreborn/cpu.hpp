@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 
 #include "psxreborn/gte.hpp"
 #include "psxreborn/memory.hpp"
@@ -10,7 +11,25 @@
 
 namespace psxreborn {
 
+inline constexpr uint32_t kCyclesPerInstruction = 2;
+
+class Jit;
 class Memory;
+
+struct CpuJitState {
+    uint32_t* regs = nullptr;
+    uint32_t* pc = nullptr;
+    uint32_t* hi = nullptr;
+    uint32_t* lo = nullptr;
+    uint32_t* cop0 = nullptr;
+    bool* pendingActive = nullptr;
+    uint8_t* pendingReg = nullptr;
+    uint32_t* pendingValue = nullptr;
+    uint32_t* pendingMask = nullptr;
+    bool* halted = nullptr;
+    Gte* gte = nullptr;
+    Memory* memory = nullptr;
+};
 
 enum class CpuStopReason {
     None,
@@ -58,22 +77,46 @@ struct CpuRunResult {
     uint32_t address = 0;
 };
 
+struct CpuStats {
+    std::array<uint64_t, 16> exceptions{};
+    uint64_t interruptExceptions = 0;
+};
+
 class Cpu {
 public:
     explicit Cpu(Memory& memory);
+    ~Cpu();
 
     void reset();
     void resetFromExe(uint32_t entryPoint, uint32_t globalPointer, uint32_t stackBase, uint32_t stackOffset);
 
     void setExecutionMode(CpuExecutionMode mode) { executionMode_ = mode; }
+    void setJitEnabled(bool enabled);
+    bool jitEnabled() const { return jitEnabled_; }
+    uint64_t jitCompiledBlocks() const;
+    uint64_t jitExecutedBlocks() const;
+    CpuJitState jitState();
+    CpuStepResult jitMemoryFault(MemoryFault fault, uint32_t pc, uint32_t instruction,
+                                 uint32_t address, bool store, bool inDelaySlot,
+                                 bool branchTaken, uint32_t branchTarget);
+    void setPendingLoad(bool active, uint8_t reg, uint32_t value, uint32_t mask) {
+        pendingLoad_ = {active, static_cast<uint8_t>(reg & 0x1Fu), value, mask};
+    }
+    void jitTick(uint32_t cycles) {
+        if (cycleCallback_) {
+            cycleCallback_(cycles);
+        }
+    }
     CpuExecutionMode executionMode() const { return executionMode_; }
     void setInterruptSource(std::function<bool()> source) { interruptSource_ = std::move(source); }
     void setCycleCallback(std::function<void(uint32_t)> callback) { cycleCallback_ = std::move(callback); }
     void setInstructionHook(std::function<bool(uint32_t)> hook) { instructionHook_ = std::move(hook); }
+    void setJitHookCompatible(bool compatible) { jitHookCompatible_ = compatible; }
     void setSyscallHandler(std::function<bool()> handler) { syscallHandler_ = std::move(handler); }
 
     CpuStepResult step();
     CpuRunResult run(uint64_t maxSteps);
+    void softTrace(uint32_t pc);
 
     uint32_t pc() const { return pc_; }
     uint32_t hi() const { return hi_; }
@@ -93,12 +136,16 @@ public:
 
     Gte& gte() { return gte_; }
     const Gte& gte() const { return gte_; }
+    const CpuStats& stats() const { return stats_; }
 
     bool halted() const { return halted_; }
     CpuStopReason haltReason() const { return haltReason_; }
     bool inDelaySlot() const { return inDelaySlot_; }
     bool pendingLoadActive() const { return pendingLoad_.active; }
     bool interruptPending() const;
+    // Synchronizes COP0.Cause with the interrupt source and takes a pending
+    // hardware interrupt. Returns true when an exception was raised.
+    bool pollInterrupt();
 
 private:
     struct PendingLoad {
@@ -140,6 +187,10 @@ private:
     std::array<uint32_t, 16> cop0_{};
     bool exceptionRaised_ = false;
     bool inException_ = false;
+    bool jitEnabled_ = false;
+    bool jitHookCompatible_ = false;
+    CpuStats stats_{};
+    std::unique_ptr<Jit> jit_;
 };
 
 const char* toString(CpuStopReason reason);
