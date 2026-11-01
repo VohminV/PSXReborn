@@ -95,18 +95,21 @@ uint8_t PadState::axisToStick(int32_t value) {
     return static_cast<uint8_t>(scaled);
 }
 
-void PadState::setLeftStick(int32_t x, int32_t y) {
+void PadState::setLeftStick(int32_t x, int32_t y, int32_t deadzone) {
     leftStickX_ = axisToStick(x);
     leftStickY_ = axisToStick(y);
     stick_ = 0;
-    if (x <= -kDefaultDeadzone) {
+    if (deadzone <= 0) {
+        deadzone = 1;
+    }
+    if (x <= -deadzone) {
         stick_ |= kPadLeft;
-    } else if (x >= kDefaultDeadzone) {
+    } else if (x >= deadzone) {
         stick_ |= kPadRight;
     }
-    if (y <= -kDefaultDeadzone) {
+    if (y <= -deadzone) {
         stick_ |= kPadUp;
-    } else if (y >= kDefaultDeadzone) {
+    } else if (y >= deadzone) {
         stick_ |= kPadDown;
     }
 }

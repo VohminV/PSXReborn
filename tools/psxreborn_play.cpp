@@ -406,6 +406,7 @@ int main(int argc, char** argv) {
     if (const char* jit = std::getenv("PSXREBORN_JIT")) {
         settings.jit = jit[0] != '0';
     }
+    settings.controllerGuid = config.getString("input.controller.guid", "");
     cpu.setJitEnabled(settings.jit);
 
     Menu menu;
@@ -529,18 +530,157 @@ int main(int argc, char** argv) {
     int leftStickY = 0;
     int rightStickX = 0;
     int rightStickY = 0;
+    std::vector<std::string> deviceNames;
+    std::vector<std::string> deviceGuids;
+    bool profileSaved = false;
+    bool controllerListDirty = true;
+    auto enumerateControllers = [&]() {
+        deviceNames.clear();
+        deviceGuids.clear();
+        for (int index = 0; index < SDL_NumJoysticks(); ++index) {
+            if (!SDL_IsGameController(index)) {
+                continue;
+            }
+            SDL_GameController* probe = SDL_GameControllerOpen(index);
+            if (probe == nullptr) {
+                continue;
+            }
+            char guidString[33];
+            SDL_JoystickGetGUIDString(
+                SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(probe)), guidString,
+                sizeof(guidString));
+            deviceNames.push_back(SDL_GameControllerName(probe) != nullptr
+                                      ? SDL_GameControllerName(probe)
+                                      : "GAMEPAD");
+            deviceGuids.push_back(guidString);
+            SDL_GameControllerClose(probe);
+        }
+    };
+    auto loadControllerProfile = [&](const std::string& guid) -> bool {
+        ControllerProfile profile;
+        std::string error;
+        if (!profile.load(ControllerProfile::pathForGuid(guid), error)) {
+            return false;
+        }
+        profile.guid = guid;
+        settings.controllerMapping = profile.mapping;
+        status.controllerProfileName = profile.deviceName.empty() ? "SAVED" : profile.deviceName;
+        profileSaved = true;
+        return true;
+    };
+    auto saveControllerProfile = [&](bool announce) {
+        if (settings.controllerGuid.empty()) {
+            if (announce) {
+                status.message = "CONTROLLER PROFILE SAVE FAILED: NO DEVICE";
+            }
+            return;
+        }
+        ControllerProfile profile;
+        profile.formatVersion = ControllerProfile::kFormatVersion;
+        profile.guid = settings.controllerGuid;
+        profile.mapping = settings.controllerMapping;
+        profile.deviceName =
+            status.controllerDeviceIndex >= 0 &&
+                    status.controllerDeviceIndex < static_cast<int>(deviceNames.size())
+                ? deviceNames[static_cast<std::size_t>(status.controllerDeviceIndex)]
+                : (controller != nullptr && SDL_GameControllerName(controller) != nullptr
+                       ? SDL_GameControllerName(controller)
+                       : std::string());
+        std::string error;
+        const std::string target = ControllerProfile::pathForGuid(profile.guid);
+        if (!profile.save(target, error)) {
+            std::cerr << "[CONTROLLER] profile save failed: " << error << "\n";
+            if (announce) {
+                status.message = "CONTROLLER PROFILE SAVE FAILED: " + error;
+            }
+            return;
+        }
+        status.controllerProfileName =
+            profile.deviceName.empty() ? "SAVED" : profile.deviceName;
+        profileSaved = true;
+        if (announce) {
+            status.message = "CONTROLLER PROFILE SAVED: " +
+                             std::filesystem::path(target).filename().string();
+        }
+    };
+    auto updateControllerStatus = [&]() {
+        // Device enumeration opens/closes SDL instances; only scan when the
+        // device list may have changed (hotplug) or the HOME menu shows it.
+        if (controllerListDirty || menu.isOpen()) {
+            enumerateControllers();
+            status.controllerDeviceNames = deviceNames;
+            status.controllerDeviceGuids = deviceGuids;
+            controllerListDirty = false;
+        }
+        status.controllerDeviceIndex = -1;
+        for (std::size_t index = 0; index < deviceGuids.size(); ++index) {
+            if ((settings.controllerGuid.empty() && index == 0) ||
+                settings.controllerGuid == deviceGuids[index]) {
+                status.controllerDeviceIndex = static_cast<int>(index);
+                if (settings.controllerGuid.empty()) {
+                    settings.controllerGuid = deviceGuids[index];
+                }
+            }
+        }
+        status.controllerConnected = controller != nullptr;
+        const std::vector<MappingConflict> conflicts =
+            mappingConflicts(settings.controllerMapping);
+        std::string conflictText;
+        for (const MappingConflict& conflict : conflicts) {
+            if (!conflictText.empty()) {
+                conflictText += "; ";
+            }
+            conflictText += std::to_string(conflict.slots.size()) + " BUTTONS ON " +
+                            hostControlName(conflict.control);
+        }
+        status.controllerConflict = conflictText;
+        std::string liveText;
+        const ControllerSnapshot& live = g_backend.lastSnapshot();
+        for (std::size_t slot = 0; slot < kPs1ButtonCount && liveText.size() < 40; ++slot) {
+            const HostControl control = settings.controllerMapping.host[slot];
+            bool pressed = false;
+            if (control < kHostAxisBase) {
+                pressed = live.buttonPressed(control);
+            } else if (control >= kHostAxisBase &&
+                       control < kHostAxisBase + kHostAxisCount) {
+                pressed = live.axes[control - kHostAxisBase] >=
+                          settings.controllerMapping.triggerThreshold;
+            }
+            if (pressed) {
+                if (!liveText.empty()) {
+                    liveText += "+";
+                }
+                liveText += ps1ButtonName(slot);
+            }
+        }
+        status.controllerLiveButtons = liveText;
+        status.controllerProfileConfigured = profileSaved;
+    };
     auto updateControllerName = [&]() {
         status.controllerName =
             controller != nullptr && SDL_GameControllerName(controller) != nullptr
                 ? SDL_GameControllerName(controller)
                 : (controller != nullptr ? "GAMEPAD" : "KEYBOARD");
     };
-    auto openController = [&](int index) {
+    auto closeController = [&]() {
         if (controller != nullptr) {
-            return;
+            SDL_GameControllerClose(controller);
+            controller = nullptr;
+            g_backend.setController(nullptr);
+        }
+        leftStickX = 0;
+        leftStickY = 0;
+        rightStickX = 0;
+        rightStickY = 0;
+        g_padState.clearController();
+        updateControllerName();
+    };
+    auto openController = [&](int index) -> bool {
+        if (controller != nullptr) {
+            return true;
         }
         if (!SDL_IsGameController(index)) {
-            return;
+            return false;
         }
         // PSXREBORN_PAD_INDEX selects which game controller (in SDL device
         // order) feeds the pad; index 0 is the default.
@@ -553,7 +693,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (seen != wanted) {
-                return;
+                return false;
             }
         }
         controller = SDL_GameControllerOpen(index);
@@ -592,12 +732,38 @@ int main(int argc, char** argv) {
             rightStickY = 0;
             g_padState.setLeftStick(0, 0);
             g_padState.setRightStick(0, 0);
-            status.message = std::string("GAMEPAD CONNECTED: ") +
-                             (SDL_GameControllerName(controller) != nullptr
-                                  ? SDL_GameControllerName(controller)
-                                  : "GAMEPAD");
+            updateControllerName();
+            g_backend.setMapping(settings.controllerMapping);
+            return true;
         }
         updateControllerName();
+        return false;
+    };
+    auto openControllerByGuid = [&](const std::string& guid) -> bool {
+        closeController();
+        int wanted = -1;
+        for (int index = 0; index < SDL_NumJoysticks(); ++index) {
+            if (!SDL_IsGameController(index)) {
+                continue;
+            }
+            SDL_GameController* probe = SDL_GameControllerOpen(index);
+            if (probe == nullptr) {
+                continue;
+            }
+            char guidString[33];
+            SDL_JoystickGetGUIDString(
+                SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(probe)), guidString,
+                sizeof(guidString));
+            SDL_GameControllerClose(probe);
+            if (guidString == guid) {
+                wanted = index;
+                break;
+            }
+        }
+        if (wanted < 0) {
+            return false;
+        }
+        return openController(wanted);
     };
     auto openJoystick = [&](int index) {
         if (joyJoystick != nullptr || controller != nullptr) {
@@ -619,10 +785,19 @@ int main(int argc, char** argv) {
     };
     std::cerr << "[DEBUG] SDL_Init gamecontroller done, SDL_NumJoysticks() = "
               << SDL_NumJoysticks() << "\n";
-    for (int index = 0; index < SDL_NumJoysticks(); ++index) {
-        openController(index);
+    updateControllerStatus();
+    // Preferred device: the GUID saved in the config; fall back to the first
+    // detected controller. Reopening honours PSXREBORN_PAD_INDEX for index
+    // selection.
+    bool controllerReady = false;
+    if (controller == nullptr && !settings.controllerGuid.empty()) {
+        controllerReady = openControllerByGuid(settings.controllerGuid);
+    }
+    for (int index = 0; index < SDL_NumJoysticks() && !controllerReady; ++index) {
+        controllerReady = openController(index) || controllerReady;
         openJoystick(index);
     }
+    updateControllerStatus();
     updateControllerName();
 
     int appliedResolution = -1;
@@ -715,6 +890,7 @@ int main(int argc, char** argv) {
             refreshCardStatus(card1, 0, status);
             refreshCardStatus(card2, 1, status);
             refreshCardChoices(settings, status);
+            updateControllerStatus();
             SDL_SetRelativeMouseMode(SDL_FALSE);
         } else {
             menu.close();
@@ -722,6 +898,35 @@ int main(int argc, char** argv) {
         }
         syncPad();
     };
+
+    // First-run flow: a connected gamepad without a saved profile gets the
+    // verified automatic Xbox -> PS1 mapping, it is persisted immediately so
+    // it shows as configured at the next start, and HOME opens on the
+    // Controller tab for review. Without a gamepad nothing blocks startup;
+    // setup stays reachable through HOME (keyboard: HOME/F1, gamepad: GUIDE).
+    if (controller != nullptr) {
+        std::cerr << "[CONTROLLER] using gamepad guid=" << settings.controllerGuid << "\n";
+        if (!loadControllerProfile(settings.controllerGuid)) {
+            settings.controllerMapping = ControllerMapping::defaults();
+            g_backend.setMapping(settings.controllerMapping);
+            saveControllerProfile(false);
+            menu.setTab(MenuTab::Controller);
+            menu.open();
+            updateControllerStatus();
+            syncPad();
+            status.message = "NEW GAMEPAD DETECTED: XBOX AUTOMAP APPLIED - REVIEW IN HOME";
+            if (config.has("input.controller.guid")) {
+                config.erase("input.controller.guid");
+            }
+            config.setString("input.controller.guid", settings.controllerGuid);
+            saveSettings();
+        }
+        updateControllerStatus();
+    } else {
+        std::cerr << "[CONTROLLER] no gamepad connected at startup; use HOME > CONTROLLER "
+                     "to set one up\n";
+    }
+    std::string activeControllerGuid = settings.controllerGuid;
 
     auto saveAllCards = [&]() {
         bool savedAny = false;
@@ -930,6 +1135,10 @@ int main(int argc, char** argv) {
             case MenuCommand::ImportCard2:
                 importCard(1);
                 break;
+            case MenuCommand::SaveControllerProfile:
+                saveControllerProfile(true);
+                updateControllerStatus();
+                break;
         }
     };
 
@@ -1097,24 +1306,20 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (event.type == SDL_CONTROLLERDEVICEADDED) {
+                controllerListDirty = true;
                 openController(event.cdevice.which);
+                updateControllerStatus();
                 continue;
             }
             if (event.type == SDL_CONTROLLERDEVICEREMOVED) {
+                controllerListDirty = true;
                 if (controller != nullptr &&
                     event.cdevice.which ==
                         SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller))) {
-                    SDL_GameControllerClose(controller);
-                    controller = nullptr;
-                    g_backend.setController(nullptr);
-                    leftStickX = 0;
-                    leftStickY = 0;
-                    rightStickX = 0;
-                    rightStickY = 0;
-                    g_padState.clearController();
+                    closeController();
                     status.message = "GAMEPAD DISCONNECTED";
-                    updateControllerName();
                 }
+                updateControllerStatus();
                 continue;
             }
             if (event.type == SDL_JOYDEVICEADDED) {
@@ -1268,52 +1473,10 @@ int main(int argc, char** argv) {
                         continue;
                     }
                 }
-                switch (event.cbutton.button) {
-                    case SDL_CONTROLLER_BUTTON_DPAD_UP:
-                        g_padState.setControllerButton(kPadUp, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
-                        g_padState.setControllerButton(kPadDown, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
-                        g_padState.setControllerButton(kPadLeft, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
-                        g_padState.setControllerButton(kPadRight, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_START:
-                        g_padState.setControllerButton(kPadStart, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_BACK:
-                        g_padState.setControllerButton(kPadSelect, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_A:
-                        g_padState.setControllerButton(kPadCross, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_B:
-                        g_padState.setControllerButton(kPadCircle, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_X:
-                        g_padState.setControllerButton(kPadSquare, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_Y:
-                        g_padState.setControllerButton(kPadTriangle, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
-                        g_padState.setControllerButton(kPadL1, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
-                        g_padState.setControllerButton(kPadR1, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_LEFTSTICK:
-                        g_padState.setControllerButton(kPadL3, pressed);
-                        break;
-                    case SDL_CONTROLLER_BUTTON_RIGHTSTICK:
-                        g_padState.setControllerButton(kPadR3, pressed);
-                        break;
-                    default:
-                        break;
-                }
+                // Non-menu gamepad buttons are not translated here: the
+                // per-frame publish + transaction-time refresh (xinput
+                // backend) apply the active player mapping instead, so HOME
+                // edits take effect immediately with a single input path.
             }
             if (event.type == SDL_JOYBUTTONDOWN || event.type == SDL_JOYBUTTONUP) {
                 if (joyJoystick == nullptr) {
@@ -1390,13 +1553,47 @@ int main(int argc, char** argv) {
         }
         inputtrace::notePublish(g_padState.buttons(), "sdl");
 
+        // Publish the raw controller snapshot once per host frame so the
+        // mapping (and live TEST INPUT view) stays current between pad
+        // transactions; the xinput backend re-polls at transaction time with
+        // its own throttle for low latency.
+        if (controller != nullptr) {
+            g_backend.publish();
+        }
+
+        updateControllerStatus();
+        if (menu.isOpen()) {
+            status.controllerName =
+                controller != nullptr && SDL_GameControllerName(controller) != nullptr
+                    ? SDL_GameControllerName(controller)
+                    : (controller != nullptr ? "GAMEPAD" : "KEYBOARD");
+        }
+
         handleCommand(menu.takeCommand());
         if (menu.takeSettingsChanged()) {
+            if (settings.controllerGuid != activeControllerGuid) {
+                if (openControllerByGuid(settings.controllerGuid)) {
+                    activeControllerGuid = settings.controllerGuid;
+                    if (!loadControllerProfile(activeControllerGuid)) {
+                        settings.controllerMapping = ControllerMapping::defaults();
+                        saveControllerProfile(false);
+                    }
+                    updateControllerName();
+                    status.message = "GAMEPAD SWITCHED: " + status.controllerName;
+                } else {
+                    status.message = "GAMEPAD NOT FOUND: " + settings.controllerGuid;
+                    settings.controllerGuid = activeControllerGuid;
+                }
+            }
+            g_backend.setMapping(settings.controllerMapping);
+            config.setString("input.controller.guid", settings.controllerGuid);
+            saveControllerProfile(false);
             saveSettings();
             applyRuntimeSettings(false);
             syncCard(card1, 0, settings, system, status, false);
             syncCard(card2, 1, settings, system, status, false);
             refreshCardChoices(settings, status);
+            updateControllerStatus();
         }
 
         syncPad();

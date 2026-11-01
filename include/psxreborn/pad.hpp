@@ -78,7 +78,7 @@ public:
     void setKeyboardButton(uint16_t button, bool pressed);
     void setControllerButton(uint16_t button, bool pressed);
     void setXInputButtons(uint16_t xinputMask);
-    void setLeftStick(int32_t x, int32_t y);
+    void setLeftStick(int32_t x, int32_t y, int32_t deadzone = kDefaultDeadzone);
     void setRightStick(int32_t x, int32_t y);
     void setSticks(uint8_t leftX, uint8_t leftY, uint8_t rightX, uint8_t rightY);
     void setTrigger(uint16_t button, int32_t value,

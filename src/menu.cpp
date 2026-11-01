@@ -345,18 +345,53 @@ std::vector<MenuItem> Menu::items(const MenuSettings& settings,
             add("DLSS DETAIL", status.dlssReason, false, false, MenuAction::None);
             add("NATIVE/FSR COMPARE", "TOGGLE UPSCALER ABOVE", false, false, MenuAction::None);
             break;
-        case MenuTab::Controller:
-            add("CONNECTED", status.controllerName, false, false, MenuAction::None);
-            add("INPUT PROTOCOL", "DIGITAL PAD", false, false, MenuAction::None);
-            add("ANALOG STICKS", status.analogControllerAvailable ? "AVAILABLE" : "NOT IMPLEMENTED",
+        case MenuTab::Controller: {
+            const bool hasDevices = !status.controllerDeviceNames.empty();
+            const bool hasChoice = hasDevices && status.controllerDeviceNames.size() > 1;
+            add("DEVICE", status.controllerDeviceIndex >= 0 &&
+                                  status.controllerDeviceIndex <
+                                      static_cast<int>(status.controllerDeviceNames.size())
+                              ? status.controllerDeviceNames[static_cast<std::size_t>(
+                                    status.controllerDeviceIndex)]
+                              : status.controllerConnected ? "UNKNOWN" : "NO CONTROLLER",
+                hasChoice, hasChoice, MenuAction::CycleControllerDevice);
+            add("DEVICE PROFILE",
+                status.controllerProfileConfigured
+                    ? (status.controllerProfileName.empty() ? "SAVED"
+                                                            : status.controllerProfileName)
+                    : "NOT SAVED",
                 false, false, MenuAction::None);
-            add("VIBRATION", status.vibrationAvailable ? "AVAILABLE" : "NOT IMPLEMENTED", false,
-                false, MenuAction::None);
-            add("PER-GAME PROFILE",
-                status.gameId.empty() ? "GLOBAL" : "CONFIG " + status.gameId, false, false,
-                MenuAction::None);
-            add("HOME BUTTON", "SHORTCUT / GUIDE", false, false, MenuAction::None);
+            add("STICK DEADZONE",
+                std::to_string(
+                    std::max(0, settings.controllerMapping.deadzone) * 100 / 32768) +
+                    "% / " + std::to_string(std::max(0, settings.controllerMapping.deadzone)),
+                true, true, MenuAction::AdjustDeadzone);
+            add("TRIGGER THRESHOLD",
+                std::to_string(
+                    std::max(0, settings.controllerMapping.triggerThreshold) * 100 / 32768) +
+                    "% / " +
+                    std::to_string(std::max(0, settings.controllerMapping.triggerThreshold)),
+                true, true, MenuAction::AdjustTriggerThreshold);
+            add("BUTTON CONFLICTS", status.controllerConflict.empty() ? "NONE"
+                                                                     : status.controllerConflict,
+                false, false, MenuAction::None);
+            add("TEST INPUT",
+                status.controllerConnected && !status.controllerLiveButtons.empty()
+                    ? status.controllerLiveButtons
+                    : status.controllerConnected ? "-" : "NO CONTROLLER",
+                false, false, MenuAction::None);
+            for (std::size_t slot = 0; slot < kPs1ButtonCount; ++slot) {
+                list.push_back(
+                    {std::string("MAP ") + ps1ButtonName(slot),
+                     hostControlName(settings.controllerMapping.host[slot]), true, false,
+                     MenuAction::AdjustMapping, static_cast<int>(slot)});
+            }
+            add("RESET TO DEFAULT", "XBOX AUTOMAP", true, false,
+                MenuAction::ResetControllerMapping);
+            add("SAVE PROFILE", "WRITE SETTINGS JSON", true, false,
+                MenuAction::SaveControllerProfile);
             break;
+        }
         case MenuTab::MouseCamera:
             add("CAPTURE CURSOR", formatBool(settings.mouseCapture), true, true,
                 MenuAction::ToggleMouseCapture);
@@ -630,6 +665,69 @@ void Menu::adjust(MenuSettings& settings, int delta, const MenuStatus& status) {
             settings.setCardPath(slot, choices[static_cast<std::size_t>(index)]);
             break;
         }
+        case MenuAction::CycleControllerDevice: {
+            const std::size_t count = status.controllerDeviceGuids.size();
+            if (count == 0) {
+                changed = false;
+                break;
+            }
+            // Prefer the actually selected GUID; fall back to the runtime's
+            // device index when it is out of the current list.
+            int index = -1;
+            for (std::size_t candidate = 0; candidate < count; ++candidate) {
+                if (settings.controllerGuid == status.controllerDeviceGuids[candidate]) {
+                    index = static_cast<int>(candidate);
+                    break;
+                }
+            }
+            if (index < 0 && status.controllerDeviceIndex >= 0 &&
+                status.controllerDeviceIndex < static_cast<int>(count)) {
+                index = status.controllerDeviceIndex;
+            }
+            index = wrapIndex(index + delta, static_cast<int>(count));
+            settings.controllerGuid = status.controllerDeviceGuids[static_cast<std::size_t>(index)];
+            break;
+        }
+        case MenuAction::AdjustMapping: {
+            const int slot = item.parameter;
+            if (slot < 0 || slot >= static_cast<int>(kPs1ButtonCount)) {
+                changed = false;
+                break;
+            }
+            const std::vector<HostControl>& choices = hostControlChoices();
+            const HostControl current =
+                settings.controllerMapping.host[static_cast<std::size_t>(slot)];
+            std::size_t index = choices.size();
+            if (current == kHostNone) {
+                index = delta < 0 ? choices.size() - 1 : 0;
+            } else {
+                for (std::size_t candidate = 0; candidate < choices.size(); ++candidate) {
+                    if (choices[candidate] == current) {
+                        index = candidate;
+                        break;
+                    }
+                }
+                if (index == choices.size()) {
+                    index = 0;
+                }
+            }
+            index = wrapIndex(static_cast<int>(index) + delta, static_cast<int>(choices.size()));
+            settings.controllerMapping.host[static_cast<std::size_t>(slot)] =
+                choices[static_cast<std::size_t>(index)];
+            break;
+        }
+        case MenuAction::AdjustDeadzone:
+            settings.controllerMapping.deadzone = std::clamp(
+                settings.controllerMapping.deadzone + delta * 1024, 0, 16384);
+            break;
+        case MenuAction::AdjustTriggerThreshold:
+            settings.controllerMapping.triggerThreshold = std::clamp(
+                settings.controllerMapping.triggerThreshold + delta * 1024, 1024, 32000);
+            break;
+        case MenuAction::ResetControllerMapping:
+            settings.controllerMapping = ControllerMapping::defaults();
+            break;
+        case MenuAction::SaveControllerProfile:
         case MenuAction::SaveState:
         case MenuAction::LoadState:
         case MenuAction::DeleteState:
@@ -717,6 +815,10 @@ void Menu::activate(MenuSettings& settings, const MenuStatus& status) {
             return;
         case MenuAction::ImportCard2:
             command_ = MenuCommand::ImportCard2;
+            return;
+        case MenuAction::SaveControllerProfile:
+            command_ = MenuCommand::SaveControllerProfile;
+            markSettingsChanged();
             return;
         case MenuAction::None:
         case MenuAction::Last:

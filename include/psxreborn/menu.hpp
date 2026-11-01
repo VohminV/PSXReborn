@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "psxreborn/config.hpp"
+#include "psxreborn/controller_profile.hpp"
 
 namespace psxreborn {
 
@@ -83,6 +84,11 @@ struct MenuSettings {
     bool card2Enabled = true;
     std::string card1Path;
     std::string card2Path;
+    // Controller setup: the guided mapping edited through HOME plus the device
+    // it applies to (host controller GUID). Persisted as a per-device JSON
+    // profile by the runtime, not through the key=value Config file.
+    std::string controllerGuid;
+    ControllerMapping controllerMapping = ControllerMapping::defaults();
 
     void load(const Config& config);
     void save(Config& config, bool gameOverride = false) const;
@@ -131,6 +137,16 @@ struct MenuStatus {
     double cpuTimeMs = 0.0;
     uint64_t jitBlocks = 0;
     uint64_t jitExecuted = 0;
+    // Controller settings tab inputs, refreshed by the runtime each frame.
+    std::vector<std::string> controllerDeviceNames;
+    std::vector<std::string> controllerDeviceGuids;
+    int controllerDeviceIndex = -1;
+    std::string controllerProfileGuid;
+    std::string controllerProfileName;
+    std::string controllerConflict;
+    std::string controllerLiveButtons;
+    bool controllerConnected = false;
+    bool controllerProfileConfigured = false;
 };
 
 enum class MenuAction : uint8_t {
@@ -172,6 +188,13 @@ enum class MenuAction : uint8_t {
     DeleteState,
     Restart,
     Quit,
+    // Controller tab
+    CycleControllerDevice,
+    AdjustMapping,
+    AdjustDeadzone,
+    AdjustTriggerThreshold,
+    ResetControllerMapping,
+    SaveControllerProfile,
     Last,
 };
 
@@ -192,6 +215,7 @@ enum class MenuCommand {
     ExportCard2,
     ImportCard1,
     ImportCard2,
+    SaveControllerProfile,
 };
 
 struct MenuItem {
@@ -200,6 +224,9 @@ struct MenuItem {
     bool enabled = true;
     bool adjustable = false;
     MenuAction action = MenuAction::None;
+    // Optional slot qualifier for parameterised actions (e.g. the PS1 button
+    // slot for MenuAction::AdjustMapping).
+    int parameter = 0;
 };
 
 class Menu {

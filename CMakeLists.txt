@@ -33,6 +33,7 @@ add_library(psxreborn_core STATIC
     src/bios.cpp
     src/cdrom.cpp
     src/config.cpp
+    src/controller_profile.cpp
     src/cpu.cpp
     src/dma.cpp
     src/memcard.cpp
@@ -121,6 +122,7 @@ if(PSXREBORN_BUILD_TESTS)
         tests/test_cop0.cpp
         tests/test_cpu.cpp
         tests/test_cdrom.cpp
+        tests/test_controller_profile.cpp
         tests/test_end_to_end.cpp
         tests/test_gte.cpp
         tests/test_hardware.cpp
