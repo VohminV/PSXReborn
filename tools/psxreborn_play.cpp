@@ -27,9 +27,9 @@
 #include "psxreborn/psx_exe.hpp"
 #if defined(PSXREBORN_HAS_VULKAN)
 #include "psxreborn/vulkan_presenter.hpp"
-
-#include "xinput_backend.hpp"
 #endif
+
+#include "glfw_backend.hpp"
 
 using namespace psxreborn;
 
@@ -37,8 +37,7 @@ namespace {
 constexpr double kCpuClock = 33868800.0;
 
 PadState g_padState;
-XInputBackend g_backend(g_padState);
-
+GlfwBackend g_backend(g_padState);
 void setButton(uint16_t bit, bool pressed) {
     g_padState.setKeyboardButton(bit, pressed);
 }
@@ -433,9 +432,26 @@ int main(int argc, char** argv) {
     syncCard(card2, 1, settings, system, status, true);
     refreshCardChoices(settings, status);
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         std::cerr << "SDL init failed: " << SDL_GetError() << "\n";
         return 1;
+    }
+
+    // GLFW takes over all controller/joystick input; SDL keeps owning the
+    // window, renderer and Vulkan surface.
+    {
+        std::string glfwError;
+        if (glfwInputInit(glfwError)) {
+            glfwLoadGamepadDatabaseIfRequested();
+            int joysticks = 0;
+            for (int jid = 0; jid <= kMaxJoystickId; ++jid) {
+                joysticks += glfwInputJoystickPresent(jid) ? 1 : 0;
+            }
+            std::cerr << "[CONTROLLER] glfw ready, joysticks=" << joysticks << "\n";
+        } else {
+            status.message = "CONTROLLER INPUT UNAVAILABLE: " + glfwError;
+            std::cerr << "[CONTROLLER] " << glfwError << "\n";
+        }
     }
 
     const ResolutionPreset& initialResolution = settings.resolution();
@@ -524,36 +540,27 @@ int main(int argc, char** argv) {
     int overlayHeight = 0;
     OverlayCanvas overlayCanvas;
 
-    SDL_GameController* controller = nullptr;
-    SDL_Joystick* joyJoystick = nullptr;
-    int leftStickX = 0;
-    int leftStickY = 0;
-    int rightStickX = 0;
-    int rightStickY = 0;
+    int controllerJid = -1;
     std::vector<std::string> deviceNames;
     std::vector<std::string> deviceGuids;
     bool profileSaved = false;
     bool controllerListDirty = true;
+    // Menu navigation edge state: GLFW is polled, not event-driven, so menu
+    // actions fire on rising-edge transitions between frames.
+    uint32_t menuPrevGamepadButtons = 0;
+    uint64_t menuPrevRawButtons = 0;
     auto enumerateControllers = [&]() {
         deviceNames.clear();
         deviceGuids.clear();
-        for (int index = 0; index < SDL_NumJoysticks(); ++index) {
-            if (!SDL_IsGameController(index)) {
+        if (!glfwInputActive()) {
+            return;
+        }
+        for (int jid = 0; jid <= kMaxJoystickId; ++jid) {
+            if (!glfwInputJoystickPresent(jid)) {
                 continue;
             }
-            SDL_GameController* probe = SDL_GameControllerOpen(index);
-            if (probe == nullptr) {
-                continue;
-            }
-            char guidString[33];
-            SDL_JoystickGetGUIDString(
-                SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(probe)), guidString,
-                sizeof(guidString));
-            deviceNames.push_back(SDL_GameControllerName(probe) != nullptr
-                                      ? SDL_GameControllerName(probe)
-                                      : "GAMEPAD");
-            deviceGuids.push_back(guidString);
-            SDL_GameControllerClose(probe);
+            deviceNames.push_back(glfwJoystickDisplayName(jid));
+            deviceGuids.push_back(glfwJoystickIdentity(jid));
         }
     };
     auto loadControllerProfile = [&](const std::string& guid) -> bool {
@@ -566,6 +573,11 @@ int main(int argc, char** argv) {
         settings.controllerMapping = profile.mapping;
         status.controllerProfileName = profile.deviceName.empty() ? "SAVED" : profile.deviceName;
         profileSaved = true;
+        // The backend holds its own copy of the mapping. Without this push a
+        // saved profile is visible in HOME but the pad keeps using the
+        // defaults until the next settings edit.
+        g_backend.setMapping(settings.controllerMapping);
+        inputtrace::chainLine("MAPPING", "profile loaded guid=%s", guid.c_str());
         return true;
     };
     auto saveControllerProfile = [&](bool announce) {
@@ -583,9 +595,8 @@ int main(int argc, char** argv) {
             status.controllerDeviceIndex >= 0 &&
                     status.controllerDeviceIndex < static_cast<int>(deviceNames.size())
                 ? deviceNames[static_cast<std::size_t>(status.controllerDeviceIndex)]
-                : (controller != nullptr && SDL_GameControllerName(controller) != nullptr
-                       ? SDL_GameControllerName(controller)
-                       : std::string());
+                : (controllerJid >= 0 ? glfwJoystickDisplayName(controllerJid)
+                                      : std::string());
         std::string error;
         const std::string target = ControllerProfile::pathForGuid(profile.guid);
         if (!profile.save(target, error)) {
@@ -604,8 +615,9 @@ int main(int argc, char** argv) {
         }
     };
     auto updateControllerStatus = [&]() {
-        // Device enumeration opens/closes SDL instances; only scan when the
-        // device list may have changed (hotplug) or the HOME menu shows it.
+        // Device enumeration opens/closes GLFW-side probes; only scan when
+        // the device list may have changed (hotplug) or the HOME menu shows
+        // it.
         if (controllerListDirty || menu.isOpen()) {
             enumerateControllers();
             status.controllerDeviceNames = deviceNames;
@@ -622,7 +634,20 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        status.controllerConnected = controller != nullptr;
+        if (status.controllerDeviceIndex < 0 && controllerJid >= 0) {
+            // The saved identity does not match any GLFW device. GLFW 3.3
+            // exposes no stable GUID (identities are "glfw:" + device name),
+            // so pre-GLFW SDL-GUID config entries cannot resolve; migrate to
+            // the open device's identity so its profile still applies.
+            settings.controllerGuid = glfwJoystickIdentity(controllerJid);
+            for (std::size_t index = 0; index < deviceGuids.size(); ++index) {
+                if (deviceGuids[index] == settings.controllerGuid) {
+                    status.controllerDeviceIndex = static_cast<int>(index);
+                    break;
+                }
+            }
+        }
+        status.controllerConnected = controllerJid >= 0;
         const std::vector<MappingConflict> conflicts =
             mappingConflicts(settings.controllerMapping);
         std::string conflictText;
@@ -658,37 +683,39 @@ int main(int argc, char** argv) {
     };
     auto updateControllerName = [&]() {
         status.controllerName =
-            controller != nullptr && SDL_GameControllerName(controller) != nullptr
-                ? SDL_GameControllerName(controller)
-                : (controller != nullptr ? "GAMEPAD" : "KEYBOARD");
+            controllerJid >= 0
+                ? (glfwJoystickDisplayName(controllerJid).empty()
+                       ? std::string("GAMEPAD")
+                       : glfwJoystickDisplayName(controllerJid))
+                : std::string("KEYBOARD");
     };
     auto closeController = [&]() {
-        if (controller != nullptr) {
-            SDL_GameControllerClose(controller);
-            controller = nullptr;
-            g_backend.setController(nullptr);
+        if (controllerJid >= 0) {
+            g_backend.setController(GlfwBackend::kNoJoystick);
+            controllerJid = -1;
+            g_padState.setLeftStick(0, 0);
+            g_padState.setRightStick(0, 0);
+            g_padState.clearController();
         }
-        leftStickX = 0;
-        leftStickY = 0;
-        rightStickX = 0;
-        rightStickY = 0;
-        g_padState.clearController();
+        menuPrevGamepadButtons = 0;
+        menuPrevRawButtons = 0;
         updateControllerName();
     };
     auto openController = [&](int index) -> bool {
-        if (controller != nullptr) {
-            return true;
+        if (controllerJid >= 0) {
+            return controllerJid == index;
         }
-        if (!SDL_IsGameController(index)) {
+        if (!glfwInputJoystickPresent(index)) {
             return false;
         }
-        // PSXREBORN_PAD_INDEX selects which game controller (in SDL device
-        // order) feeds the pad; index 0 is the default.
+        // PSXREBORN_PAD_INDEX selects which game controller (in GLFW device
+        // order, counting gamepad-configurable devices) feeds the pad;
+        // index 0 is the default.
         if (const char* padIndex = std::getenv("PSXREBORN_PAD_INDEX")) {
             const int wanted = std::atoi(padIndex);
             int seen = 0;
             for (int other = 0; other < index; ++other) {
-                if (SDL_IsGameController(other)) {
+                if (glfwControllerIsGamepad(other)) {
                     ++seen;
                 }
             }
@@ -696,68 +723,30 @@ int main(int argc, char** argv) {
                 return false;
             }
         }
-        controller = SDL_GameControllerOpen(index);
-        std::cerr << "[DEBUG] openController(" << index << ") -> " << (controller != nullptr) << "\n";
-        if (controller != nullptr) {
-            g_backend.setController(controller);
-            SDL_Joystick* joy = SDL_GameControllerGetJoystick(controller);
-            SDL_JoystickGUID guid = SDL_JoystickGetGUID(joy);
-            char guidString[33];
-            SDL_JoystickGetGUIDString(guid, guidString, sizeof(guidString));
-            std::cerr << "[DEBUG] openController(" << index << ") guid=" << guidString << "\n";
-            char* mapping = SDL_GameControllerMapping(controller);
-            if (mapping != nullptr) {
-                std::cerr << "[DEBUG] openController(" << index << ") mapping=" << mapping << "\n";
-                SDL_free(mapping);
-            } else {
-                std::cerr << "[DEBUG] openController(" << index << ") mapping=NONE\n";
-            }
-            // Log physical button bindings for Start/Back so mapping issues
-            // are visible: "start:b7" means physical button 7 -> logical START.
-            auto logBind = [&](SDL_GameControllerButton b) {
-                const char* name = SDL_GameControllerGetStringForButton(b);
-                SDL_GameControllerButtonBind bind =
-                    SDL_GameControllerGetBindForButton(controller, b);
-                std::cerr << "[DEBUG] bind " << (name != nullptr ? name : "?")
-                          << " -> type=" << static_cast<int>(bind.bindType)
-                          << " button=" << bind.value.button << "\n";
-            };
-            logBind(SDL_CONTROLLER_BUTTON_START);
-            logBind(SDL_CONTROLLER_BUTTON_BACK);
-            logBind(SDL_CONTROLLER_BUTTON_A);
-            logBind(SDL_CONTROLLER_BUTTON_B);
-            leftStickX = 0;
-            leftStickY = 0;
-            rightStickX = 0;
-            rightStickY = 0;
-            g_padState.setLeftStick(0, 0);
-            g_padState.setRightStick(0, 0);
-            updateControllerName();
-            g_backend.setMapping(settings.controllerMapping);
-            return true;
-        }
+        controllerJid = index;
+        g_backend.setController(index);
+        std::cerr << "[CONTROLLER] opened joystick " << index << " name="
+                  << glfwJoystickDisplayName(index) << " gamepad="
+                  << (glfwControllerIsGamepad(index) ? "yes" : "no (raw layout)")
+                  << "\n";
+        g_padState.setLeftStick(0, 0);
+        g_padState.setRightStick(0, 0);
         updateControllerName();
-        return false;
+        g_backend.setMapping(settings.controllerMapping);
+        return true;
     };
     auto openControllerByGuid = [&](const std::string& guid) -> bool {
         closeController();
         int wanted = -1;
-        for (int index = 0; index < SDL_NumJoysticks(); ++index) {
-            if (!SDL_IsGameController(index)) {
-                continue;
-            }
-            SDL_GameController* probe = SDL_GameControllerOpen(index);
-            if (probe == nullptr) {
-                continue;
-            }
-            char guidString[33];
-            SDL_JoystickGetGUIDString(
-                SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(probe)), guidString,
-                sizeof(guidString));
-            SDL_GameControllerClose(probe);
-            if (guidString == guid) {
-                wanted = index;
-                break;
+        if (glfwInputActive()) {
+            for (int index = 0; index <= kMaxJoystickId; ++index) {
+                if (!glfwInputJoystickPresent(index)) {
+                    continue;
+                }
+                if (glfwJoystickIdentity(index) == guid) {
+                    wanted = index;
+                    break;
+                }
             }
         }
         if (wanted < 0) {
@@ -765,37 +754,28 @@ int main(int argc, char** argv) {
         }
         return openController(wanted);
     };
-    auto openJoystick = [&](int index) {
-        if (joyJoystick != nullptr || controller != nullptr) {
-            return;
-        }
-        if (SDL_IsGameController(index)) {
-            return;
-        }
-        joyJoystick = SDL_JoystickOpen(index);
-        if (joyJoystick != nullptr) {
-            g_padState.setLeftStick(0, 0);
-            g_padState.setRightStick(0, 0);
-            status.message = std::string("JOYSTICK CONNECTED: ") +
-                             (SDL_JoystickName(joyJoystick) != nullptr
-                                  ? SDL_JoystickName(joyJoystick)
-                                  : "JOYSTICK");
-        }
-        updateControllerName();
-    };
-    std::cerr << "[DEBUG] SDL_Init gamecontroller done, SDL_NumJoysticks() = "
-              << SDL_NumJoysticks() << "\n";
+    std::cerr << "[DEBUG] controller enumeration done, devices="
+              << [&]() {
+                     int count = 0;
+                     if (glfwInputActive()) {
+                         for (int jid = 0; jid <= kMaxJoystickId; ++jid) {
+                             count += glfwInputJoystickPresent(jid) ? 1 : 0;
+                         }
+                     }
+                     return count;
+                 }() << "\n";
     updateControllerStatus();
-    // Preferred device: the GUID saved in the config; fall back to the first
-    // detected controller. Reopening honours PSXREBORN_PAD_INDEX for index
+    // Preferred device: the identity saved in the config; fall back to the
+    // first detected controller. Reopening honours PSXREBORN_PAD_INDEX for jid
     // selection.
     bool controllerReady = false;
-    if (controller == nullptr && !settings.controllerGuid.empty()) {
+    if (controllerJid < 0 && !settings.controllerGuid.empty()) {
         controllerReady = openControllerByGuid(settings.controllerGuid);
     }
-    for (int index = 0; index < SDL_NumJoysticks() && !controllerReady; ++index) {
-        controllerReady = openController(index) || controllerReady;
-        openJoystick(index);
+    if (glfwInputActive()) {
+        for (int index = 0; index <= kMaxJoystickId && !controllerReady; ++index) {
+            controllerReady = openController(index) || controllerReady;
+        }
     }
     updateControllerStatus();
     updateControllerName();
@@ -886,6 +866,7 @@ int main(int argc, char** argv) {
             return;
         }
         if (open) {
+            inputtrace::chainLine("MENU", "open");
             menu.open();
             refreshCardStatus(card1, 0, status);
             refreshCardStatus(card2, 1, status);
@@ -893,6 +874,7 @@ int main(int argc, char** argv) {
             updateControllerStatus();
             SDL_SetRelativeMouseMode(SDL_FALSE);
         } else {
+            inputtrace::chainLine("MENU", "close");
             menu.close();
             SDL_SetRelativeMouseMode(settings.mouseCapture ? SDL_TRUE : SDL_FALSE);
         }
@@ -904,13 +886,14 @@ int main(int argc, char** argv) {
     // it shows as configured at the next start, and HOME opens on the
     // Controller tab for review. Without a gamepad nothing blocks startup;
     // setup stays reachable through HOME (keyboard: HOME/F1, gamepad: GUIDE).
-    if (controller != nullptr) {
-        std::cerr << "[CONTROLLER] using gamepad guid=" << settings.controllerGuid << "\n";
+    if (controllerJid >= 0) {
+        std::cerr << "[CONTROLLER] using gamepad identity=" << settings.controllerGuid << "\n";
         if (!loadControllerProfile(settings.controllerGuid)) {
             settings.controllerMapping = ControllerMapping::defaults();
             g_backend.setMapping(settings.controllerMapping);
             saveControllerProfile(false);
             menu.setTab(MenuTab::Controller);
+            inputtrace::chainLine("MENU", "open first-run");
             menu.open();
             updateControllerStatus();
             syncPad();
@@ -1142,6 +1125,92 @@ int main(int argc, char** argv) {
         }
     };
 
+    // Per-frame GLFW joystick state: GLFW is polled, so menu navigation and
+    // game input use rising-edge transitions between frames instead of the
+    // former SDL button/axis events. Hotplug arrives buffered by the backend
+    // callback during its refresh polls.
+    auto handleControllerFrameInput = [&]() {
+        JoystickEvent joyEvent;
+        bool controllerListChanged = false;
+        while (pollJoystickEvent(joyEvent)) {
+            controllerListChanged = true;
+            if (joyEvent.connected) {
+                if (controllerJid < 0) {
+                    openController(joyEvent.jid);
+                    status.message = std::string("JOYSTICK CONNECTED: ") +
+                                     glfwJoystickDisplayName(joyEvent.jid);
+                }
+            } else if (controllerJid == joyEvent.jid) {
+                closeController();
+                status.message = "GAMEPAD DISCONNECTED";
+            }
+        }
+        controllerListDirty = controllerListDirty || controllerListChanged;
+
+        // The refresh inside publish is also where GLFW gets its poll; keep
+        // it unconditional so joystick events keep flowing while the pad is
+        // closed.
+        g_backend.publish();
+
+        const ControllerSnapshot& snapshot = g_backend.lastSnapshot();
+        if (g_backend.gamepadMode()) {
+            const uint32_t buttons = snapshot.buttons;
+            const uint32_t rising = buttons & ~menuPrevGamepadButtons;
+            menuPrevGamepadButtons = buttons;
+            if ((rising & (1u << kHostBtnGuide)) != 0) {
+                setMenuOpen(!menu.isOpen());
+            }
+            if (menu.isOpen()) {
+                if ((rising & (1u << kHostBtnDpadUp)) != 0) {
+                    menu.move(-1);
+                }
+                if ((rising & (1u << kHostBtnDpadDown)) != 0) {
+                    menu.move(1);
+                }
+                if ((rising & (1u << kHostBtnDpadLeft)) != 0) {
+                    menu.adjust(settings, -1, status);
+                }
+                if ((rising & (1u << kHostBtnDpadRight)) != 0) {
+                    menu.adjust(settings, 1, status);
+                }
+                if ((rising & (1u << kHostBtnA)) != 0) {
+                    menu.activate(settings, status);
+                }
+                if ((rising & ((1u << kHostBtnB) | (1u << kHostBtnStart))) != 0) {
+                    setMenuOpen(false);
+                }
+                if ((rising & (1u << kHostBtnRightBumper)) != 0) {
+                    menu.moveTab(1);
+                }
+                if ((rising & (1u << kHostBtnLeftBumper)) != 0) {
+                    menu.moveTab(-1);
+                }
+            }
+            // Non-menu gamepad buttons are not translated here: the per-frame
+            // publish + transaction-time refresh (glfw backend) apply the
+            // active mapping instead, so HOME edits take effect immediately
+            // with a single input path.
+        } else {
+            const uint64_t rising = snapshot.rawButtons & ~menuPrevRawButtons;
+            menuPrevRawButtons = snapshot.rawButtons;
+            const auto rawRising = [&](int index) {
+                return (rising & (1ull << (kHostRawBtnBase + index))) != 0;
+            };
+            // Raw-layout guide button sits at physical button 8.
+            if (rawRising(8)) {
+                setMenuOpen(!menu.isOpen());
+            }
+            if (menu.isOpen()) {
+                if (rawRising(0)) {
+                    menu.activate(settings, status);
+                }
+                if (rawRising(1) || rawRising(7)) {
+                    setMenuOpen(false);
+                }
+            }
+        }
+    };
+
     auto lastFrame = std::chrono::steady_clock::now();
     auto lastInputSummary = lastFrame;
     uint64_t lastSummaryTx = 0;
@@ -1152,10 +1221,11 @@ int main(int argc, char** argv) {
 
     while (running) {
         const auto frameStart = std::chrono::steady_clock::now();
+        ++hostFrameIndex;
+        inputtrace::beginFrame(hostFrameIndex);
         const double elapsedSinceFrame =
             std::chrono::duration<double>(frameStart - lastFrame).count();
         lastFrame = frameStart;
-        SDL_GameControllerUpdate();
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
@@ -1305,268 +1375,16 @@ int main(int argc, char** argv) {
                 }
                 continue;
             }
-            if (event.type == SDL_CONTROLLERDEVICEADDED) {
-                controllerListDirty = true;
-                openController(event.cdevice.which);
-                updateControllerStatus();
-                continue;
-            }
-            if (event.type == SDL_CONTROLLERDEVICEREMOVED) {
-                controllerListDirty = true;
-                if (controller != nullptr &&
-                    event.cdevice.which ==
-                        SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller))) {
-                    closeController();
-                    status.message = "GAMEPAD DISCONNECTED";
-                }
-                updateControllerStatus();
-                continue;
-            }
-            if (event.type == SDL_JOYDEVICEADDED) {
-                openJoystick(event.jdevice.which);
-                continue;
-            }
-            if (event.type == SDL_JOYDEVICEREMOVED) {
-                if (joyJoystick != nullptr &&
-                    event.jdevice.which == SDL_JoystickInstanceID(joyJoystick)) {
-                    SDL_JoystickClose(joyJoystick);
-                    joyJoystick = nullptr;
-                    leftStickX = 0;
-                    leftStickY = 0;
-                    rightStickX = 0;
-                    rightStickY = 0;
-                    g_padState.clearController();
-                    status.message = "JOYSTICK DISCONNECTED";
-                    updateControllerName();
-                }
-                continue;
-            }
-            if (event.type == SDL_CONTROLLERAXISMOTION) {
-                switch (event.caxis.axis) {
-                    case SDL_CONTROLLER_AXIS_LEFTX:
-                        leftStickX = event.caxis.value;
-                        g_padState.setLeftStick(leftStickX, leftStickY);
-                        break;
-                    case SDL_CONTROLLER_AXIS_LEFTY:
-                        leftStickY = event.caxis.value;
-                        g_padState.setLeftStick(leftStickX, leftStickY);
-                        break;
-                    case SDL_CONTROLLER_AXIS_RIGHTX:
-                        rightStickX = event.caxis.value;
-                        g_padState.setRightStick(rightStickX, rightStickY);
-                        break;
-                    case SDL_CONTROLLER_AXIS_RIGHTY:
-                        rightStickY = event.caxis.value;
-                        g_padState.setRightStick(rightStickX, rightStickY);
-                        break;
-                    case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
-                        g_padState.setTrigger(kPadL2, event.caxis.value);
-                        break;
-                    case SDL_CONTROLLER_AXIS_TRIGGERRIGHT:
-                        g_padState.setTrigger(kPadR2, event.caxis.value);
-                        break;
-                    default:
-                        break;
-                }
-                continue;
-            }
-            if (event.type == SDL_JOYAXISMOTION) {
-                if (joyJoystick == nullptr) {
-                    continue;
-                }
-                switch (event.jaxis.axis) {
-                    case 0:
-                        leftStickX = event.jaxis.value;
-                        g_padState.setLeftStick(leftStickX, leftStickY);
-                        break;
-                    case 1:
-                        leftStickY = event.jaxis.value;
-                        g_padState.setLeftStick(leftStickX, leftStickY);
-                        break;
-                    case 2:
-                        g_padState.setTrigger(kPadL2, event.jaxis.value);
-                        break;
-                    case 3:
-                        rightStickX = event.jaxis.value;
-                        g_padState.setRightStick(rightStickX, rightStickY);
-                        break;
-                    case 4:
-                        rightStickY = event.jaxis.value;
-                        g_padState.setRightStick(rightStickX, rightStickY);
-                        break;
-                    case 5:
-                        g_padState.setTrigger(kPadR2, event.jaxis.value);
-                        break;
-                    case 6:
-                        g_padState.setControllerButton(kPadLeft, event.jaxis.value < -16384);
-                        g_padState.setControllerButton(kPadRight, event.jaxis.value > 16384);
-                        break;
-                    case 7:
-                        g_padState.setControllerButton(kPadUp, event.jaxis.value < -16384);
-                        g_padState.setControllerButton(kPadDown, event.jaxis.value > 16384);
-                        break;
-                    default:
-                        break;
-                }
-                continue;
-            }
-            if (event.type == SDL_CONTROLLERBUTTONDOWN ||
-                event.type == SDL_CONTROLLERBUTTONUP) {
-                // event.cbutton.button is the SDL logical button enum, not the
-                // physical joystick button number. SDL_CONTROLLER_BUTTON_START
-                // is always 6 regardless of the controller's physical layout;
-                // the physical button is resolved via the controller mapping.
-                const auto logical =
-                    static_cast<SDL_GameControllerButton>(event.cbutton.button);
-                const char* logicalName = SDL_GameControllerGetStringForButton(logical);
-                int physicalButton = -1;
-                if (controller != nullptr) {
-                    physicalButton =
-                        SDL_GameControllerGetBindForButton(controller, logical)
-                            .value.button;
-                }
-                std::cerr << "[DEBUG] CB logical=" << static_cast<int>(event.cbutton.button)
-                          << "(" << (logicalName != nullptr ? logicalName : "?")
-                          << ") physical=" << physicalButton
-                          << " pressed=" << (event.type == SDL_CONTROLLERBUTTONDOWN)
-                          << "\n";
-                const bool pressed = event.type == SDL_CONTROLLERBUTTONDOWN;
-                if (pressed && event.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE) {
-                    setMenuOpen(!menu.isOpen());
-                    continue;
-                }
-                if (menu.isOpen()) {
-                    if (pressed) {
-                        switch (event.cbutton.button) {
-                            case SDL_CONTROLLER_BUTTON_DPAD_UP:
-                                menu.move(-1);
-                                break;
-                            case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
-                                menu.move(1);
-                                break;
-                            case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
-                                menu.adjust(settings, -1, status);
-                                break;
-                            case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
-                                menu.adjust(settings, 1, status);
-                                break;
-                            case SDL_CONTROLLER_BUTTON_A:
-                                menu.activate(settings, status);
-                                break;
-                            case SDL_CONTROLLER_BUTTON_B:
-                                setMenuOpen(false);
-                                break;
-                            case SDL_CONTROLLER_BUTTON_START:
-                                setMenuOpen(false);
-                                break;
-                            case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
-                                menu.moveTab(1);
-                                break;
-                            case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
-                                menu.moveTab(-1);
-                                break;
-                            default:
-                                break;
-                        }
-                    }
-                    if (event.cbutton.button != SDL_CONTROLLER_BUTTON_START) {
-                        continue;
-                    }
-                }
-                // Non-menu gamepad buttons are not translated here: the
-                // per-frame publish + transaction-time refresh (xinput
-                // backend) apply the active player mapping instead, so HOME
-                // edits take effect immediately with a single input path.
-            }
-            if (event.type == SDL_JOYBUTTONDOWN || event.type == SDL_JOYBUTTONUP) {
-                if (joyJoystick == nullptr) {
-                    continue;
-                }
-                const bool pressed = event.type == SDL_JOYBUTTONDOWN;
-                const int button = event.jbutton.button;
-                if (pressed && button == 8) {
-                    setMenuOpen(!menu.isOpen());
-                    continue;
-                }
-                if (menu.isOpen()) {
-                    if (pressed) {
-                        switch (button) {
-                            case 0:
-                                menu.activate(settings, status);
-                                break;
-                            case 1:
-                            case 7:
-                                setMenuOpen(false);
-                                break;
-                            default:
-                                break;
-                        }
-                    }
-                    continue;
-                }
-                switch (button) {
-                    case 0:
-                        g_padState.setControllerButton(kPadCross, pressed);
-                        break;
-                    case 1:
-                        g_padState.setControllerButton(kPadCircle, pressed);
-                        break;
-                    case 2:
-                        g_padState.setControllerButton(kPadSquare, pressed);
-                        break;
-                    case 3:
-                        g_padState.setControllerButton(kPadTriangle, pressed);
-                        break;
-                    case 4:
-                        g_padState.setControllerButton(kPadL1, pressed);
-                        break;
-                    case 5:
-                        g_padState.setControllerButton(kPadR1, pressed);
-                        break;
-                    case 6:
-                        g_padState.setControllerButton(kPadSelect, pressed);
-                        break;
-                    case 7:
-                        g_padState.setControllerButton(kPadStart, pressed);
-                        break;
-                    case 9:
-                        g_padState.setControllerButton(kPadL3, pressed);
-                        break;
-                    case 10:
-                        g_padState.setControllerButton(kPadR3, pressed);
-                        break;
-                    default:
-                        std::cerr << "[DEBUG] JB unhandled button=" << button << "\n";
-                        break;
-                }
-            }
-            if (event.type == SDL_JOYHATMOTION) {
-                if (joyJoystick == nullptr) {
-                    continue;
-                }
-                const uint8_t hat = event.jhat.value;
-                g_padState.setControllerButton(kPadUp, (hat & SDL_HAT_UP) != 0);
-                g_padState.setControllerButton(kPadDown, (hat & SDL_HAT_DOWN) != 0);
-                g_padState.setControllerButton(kPadLeft, (hat & SDL_HAT_LEFT) != 0);
-                g_padState.setControllerButton(kPadRight, (hat & SDL_HAT_RIGHT) != 0);
-            }
         }
-        inputtrace::notePublish(g_padState.buttons(), "sdl");
-
-        // Publish the raw controller snapshot once per host frame so the
-        // mapping (and live TEST INPUT view) stays current between pad
-        // transactions; the xinput backend re-polls at transaction time with
-        // its own throttle for low latency.
-        if (controller != nullptr) {
-            g_backend.publish();
-        }
-
+        handleControllerFrameInput();
         updateControllerStatus();
         if (menu.isOpen()) {
             status.controllerName =
-                controller != nullptr && SDL_GameControllerName(controller) != nullptr
-                    ? SDL_GameControllerName(controller)
-                    : (controller != nullptr ? "GAMEPAD" : "KEYBOARD");
+                controllerJid >= 0
+                    ? (glfwJoystickDisplayName(controllerJid).empty()
+                           ? std::string("GAMEPAD")
+                           : glfwJoystickDisplayName(controllerJid))
+                    : std::string("KEYBOARD");
         }
 
         handleCommand(menu.takeCommand());
@@ -1872,7 +1690,6 @@ int main(int argc, char** argv) {
             elapsedSinceFrame > 0.0 ? 1.0 / elapsedSinceFrame : smoothedFps;
         smoothedFps = smoothedFps * 0.9 + measuredFps * 0.1;
 
-        ++hostFrameIndex;
         if (inputtrace::enabled() && frameStart >= lastInputSummary + std::chrono::seconds(1)) {
             const inputtrace::Summary summaryNow = inputtrace::summary();
             const double window =
@@ -1915,12 +1732,6 @@ int main(int argc, char** argv) {
     if (menu.takeSettingsChanged()) {
         saveSettings();
     }
-    if (controller != nullptr) {
-        SDL_GameControllerClose(controller);
-    }
-    if (joyJoystick != nullptr) {
-        SDL_JoystickClose(joyJoystick);
-    }
     if (overlayTexture != nullptr) {
         SDL_DestroyTexture(overlayTexture);
     }
@@ -1935,5 +1746,6 @@ int main(int argc, char** argv) {
 #endif
     SDL_DestroyWindow(window);
     SDL_Quit();
+    glfwInputShutdown();
     return 0;
 }

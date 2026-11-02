@@ -106,14 +106,22 @@ reaches the configured size. The /ACK interrupt is latched only when bit 12 is
 set, after the emulated /ACK release delay (~130 cycles), matching the BIOS
 requirement that the pad IRQ must not occur in the same cycle as the transfer.
 
-The host input path is SDL2 GameController. On Windows SDL2 uses XInput for
-Xbox-compatible pads; on Linux it uses the kernel gamepad interface. The
-button mapping is A->Cross, B->Circle, X->Square, Y->Triangle, LB->L1,
-RB->R1, Back->Select, Start->Start, with the D-pad passed through. Analog
-triggers drive L2/R2 and the left stick can emulate the D-pad after a
-deadzone. Native backends that receive an XInput digital button mask can use
+The host controller input path uses GLFW (the play tool keeps SDL2 for the
+window/renderer backend). The mapping layer speaks `ControllerSnapshot` in a
+GLFW button id space: buttons 0..14 mirror `GLFW_GAMEPAD_BUTTON_*` one to one
+(A->Cross, B->Circle, X->Square, Y->Triangle, LB->L1, RB->R1, Back->Select,
+Start->Start, D-pad passed through), axis controls are `kHostAxisBase +
+axis` in GLFW axis order (LX, LY, RX, RY, LT, RT; analog triggers drive L2/R2
+and the left stick can emulate the D-pad after a deadzone). GLFW pads with a
+gamepad mapping use `glfwGetGamepadState`; devices without a mapping fall back
+to a raw joystick path that fills the snapshot's raw fields and transposes a
+documented Xbox/DInput-style layout onto the semantic GLFW ids. Native
+backends that receive an XInput digital button mask can still use
 `xinputToPadButtons()` or `PadState::setXInputButtons()`; both apply the same
-mapping.
+mapping. Per-device JSON profiles are identified by a device-name based
+identity (`glfw:<name>`), because GLFW 3.3 exposes no stable joystick GUID
+(`glfwGetJoystickGUID` exists only in GLFW 3.4+); SDL-format mapping databases
+can be applied through `PSXREBORN_GAMEPAD_DB`.
 
 ### DualShock / analog pad
 
@@ -131,10 +139,11 @@ config sequence. Rumble and multitap are not implemented.
 `Sio0` samples host input through the `PadSource` interface when the guest
 asserts /CS and writes the pad address byte `0x01`. The snapshot is latched
 for the whole transaction so mid-poll host changes cannot tear a response.
-`XInputBackend` (play tool) refreshes SDL controller state at pad-select time
-(throttled to 250 us), independent of host frame cadence, then publishes into
-`PadState`. The BIOS pad path calls `System::refreshPadFromSource()` before
-reading pad state so HLE pad services also see fresh input.
+`GlfwBackend` (play tool) refreshes GLFW controller state at pad-select time
+(throttled to 250 us; GLFW device state updates during `glfwPollEvents`),
+independent of host frame cadence, then publishes into `PadState`. The BIOS
+pad path calls `System::refreshPadFromSource()` before reading pad state so
+HLE pad services also see fresh input.
 
 Measured on this machine (Release build, digital `0x42` transaction, no host
 controller attached): full transaction average 99 ns, host update to first
@@ -142,6 +151,23 @@ guest-visible button byte average 92 ns (p99 105 ns). The previous
 frame-quantized path added up to one host frame of delay (16.7 ms at 60 FPS,
 6.9 ms at 144 FPS). Instrumentation is available via
 `PSXREBORN_TRACE_INPUT=1|2`.
+
+The controller path is a single chain: GLFW gamepad state ->
+`ControllerMapping` (per-device JSON profile) -> `PadState` -> `Sio0` pad
+transaction; BIOS pad services read the same `PadState`. `HostControl` button
+ids for GLFW gamepads must remain identical to `GLFW_GAMEPAD_BUTTON_*`
+(face buttons 0..3, bumpers 4..5, back/start/guide 6..8, thumb clicks 9..10,
+D-pad 11..14). If they drift, the default D-pad mapping silently becomes
+L3/R3 and Home navigation watches the wrong bits.
+
+For end-to-end diagnosis set `PSXREBORN_TRACE_CHAIN=1` (or
+`PSXREBORN_TRACE_INPUT=3`). Every line carries the same play-loop frame id and
+one of the layers `HOST`, `MAPPING`, `PAD`, `SIO0`, `BIOS`, `MENU`, so a single
+physical press can be followed from the raw GLFW snapshot to the active-low
+SIO response and BIOS buffer bytes. `PSXREBORN_TRACE_INPUT=1|2` remains the
+lower-volume transaction summary. Home does not own a second controller:
+opening it only suppresses the shared `GlfwBackend` sample and BIOS pad state,
+and closing it re-enables the same mapping.
 
 ## Vulkan Shader Modules
 
@@ -254,8 +280,9 @@ of generated PS-X EXE test images.
   behavior is still incomplete for uncommon paths.
 - SIO0 implements the digital and DualShock pad poll paths plus memory-card
   commands; rumble, multitap, and mouse are unsupported.
-- Host controller input requires SDL2; the core has no platform input backend
-  compiled in by default (the play tool links XInputBackend).
+- Host controller input requires GLFW (play tool links `GlfwBackend`); the
+  core itself has no platform input backend compiled in by default. Window,
+  renderer, and Vulkan surface stay on SDL2.
 - Vulkan support in the core is limited to shader module creation; the play
   tool owns the Vulkan presenter instance, swapchain, and render pass.
 - Dynamic module and self-modifying-code handling exists but has not been

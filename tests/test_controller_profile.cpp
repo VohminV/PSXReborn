@@ -41,19 +41,57 @@ TEST_CASE(controller_mapping_defaults_cover_every_ps1_button) {
 
 TEST_CASE(controller_mapping_default_matches_manual_xbox_automap) {
     const ControllerMapping mapping = ControllerMapping::defaults();
-    // The same table the historical hard-coded SDL/xinput path used.
-    const std::size_t expectedSources[] = {8, 9, 10, 11, 12, 13, 14, 15, 6, 4, 9, 10, 0, 1, 2, 3};
-    (void)expectedSources;
+    // PS1 slot order: cross, circle, square, triangle, up, down, left, right,
+    // start, select, l1, r1, l2, r2, l3, r3. The source ids are GLFW gamepad
+    // button indices (9..14 are thumb clicks and D-pad, not 9..14 in a made-up
+    // order).
+    const HostControl expectedSources[] = {
+        kHostBtnA, kHostBtnB, kHostBtnX, kHostBtnY,
+        kHostBtnDpadUp, kHostBtnDpadDown, kHostBtnDpadLeft, kHostBtnDpadRight,
+        kHostBtnStart, kHostBtnBack, kHostBtnLeftBumper, kHostBtnRightBumper,
+        kHostAxisTriggerLeft, kHostAxisTriggerRight, kHostBtnLeftThumb,
+        kHostBtnRightThumb};
+    for (std::size_t slot = 0; slot < kPs1ButtonCount; ++slot) {
+        CHECK_EQ(mapping.host[slot], expectedSources[slot]);
+    }
     PadState pad;
-    // Press A: cross only (same as the previous kXInputA path).
+    // Press A: cross only (same as the GLFW Xbox-layout default path).
     pad.clearController();
     ControllerSnapshot snapshot = snapshotWithButtons(1u << kHostBtnA);
-    snapshot.setButtonPressed(kHostBtnLeftShoulder, true);
+    snapshot.setButtonPressed(kHostBtnLeftBumper, true);
     applyControllerSnapshot(pad, snapshot, mapping);
     CHECK_EQ(pad.pressed(), static_cast<uint16_t>(kPadCross | kPadL1));
     // Release: no ghost buttons.
     applyControllerSnapshot(pad, snapshotWithButtons(0), mapping);
     CHECK_EQ(pad.buttons(), static_cast<uint16_t>(0xFFFFu));
+}
+
+TEST_CASE(controller_defaults_use_glfw_gamepad_button_ids) {
+    // The gamepad backend stores GLFW_GAMEPAD_BUTTON_* indices directly in
+    // ControllerSnapshot::buttons. Assert the constants stay aligned so a
+    // D-pad press cannot silently become an L3 press (the Home automap
+    // regression) and the menu navigation edges read the right bits.
+    CHECK_EQ(kHostBtnLeftThumb, static_cast<HostControl>(9));
+    CHECK_EQ(kHostBtnRightThumb, static_cast<HostControl>(10));
+    CHECK_EQ(kHostBtnDpadUp, static_cast<HostControl>(11));
+    CHECK_EQ(kHostBtnDpadRight, static_cast<HostControl>(12));
+    CHECK_EQ(kHostBtnDpadDown, static_cast<HostControl>(13));
+    CHECK_EQ(kHostBtnDpadLeft, static_cast<HostControl>(14));
+
+    const ControllerMapping mapping = ControllerMapping::defaults();
+    PadState pad;
+    ControllerSnapshot snapshot;
+    snapshot.setButtonPressed(static_cast<HostControl>(13), true);  // GLFW DPAD_DOWN
+    applyControllerSnapshot(pad, snapshot, mapping);
+    CHECK_EQ(pad.pressed(), static_cast<uint16_t>(kPadDown));
+    snapshot = ControllerSnapshot{};
+    snapshot.setButtonPressed(static_cast<HostControl>(9), true);  // GLFW LEFT_THUMB
+    applyControllerSnapshot(pad, snapshot, mapping);
+    CHECK_EQ(pad.pressed(), static_cast<uint16_t>(kPadL3));
+    snapshot = ControllerSnapshot{};
+    snapshot.setButtonPressed(static_cast<HostControl>(14), true);  // GLFW DPAD_LEFT
+    applyControllerSnapshot(pad, snapshot, mapping);
+    CHECK_EQ(pad.pressed(), static_cast<uint16_t>(kPadLeft));
 }
 
 TEST_CASE(controller_mapping_apply_maps_every_button) {

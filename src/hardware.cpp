@@ -47,7 +47,15 @@ bool Interrupts::read32(uint32_t address, uint32_t& value) const {
 
 bool Interrupts::write32(uint32_t address, uint32_t value) {
     if (address == kStatAddress) {
-        status_ &= value & 0x7FFu;
+        // I_STAT write semantics (docs + psx-spx "Interrupts"): the register
+        // is 11 bits wide, and a written 0 bit clears the flag while a written
+        // 1 bit leaves it unchanged, i.e. I_STAT = I_STAT AND value. Guest
+        // code commonly writes masks with high bits set (e.g. 0xFFFFFF7F to
+        // clear IRQ7 or 0xFFF7 to clear IRQ3), so the written value must not
+        // be truncated with 0x7FF before the AND: doing so makes the game's
+        // interrupt vectors (e.g. 5 Star Racing) unable to acknowledge the
+        // controller IRQ and spins forever in the pad driver wait loop.
+        status_ &= value;
         return true;
     }
     if (address == kMaskAddress) {
@@ -376,6 +384,7 @@ bool System::read32(uint32_t address, uint32_t& value, MemoryFault* fault) {
     if (interrupts_.read32(address, value) || timers_.read32(address, value) ||
         dma_.read32(address, value) || gpu_.read32(address, value, fault) ||
         spu_.read32(address, value)) {
+        if (traceIo(address)) { std::fprintf(stderr, "[IO] V %08X -> %08X\n", address, value); }
         setFault(fault, MemoryFault::None);
         return true;
     }

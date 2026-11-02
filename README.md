@@ -42,15 +42,16 @@ The project is intended to separate guest hardware behavior from host-specific i
 | PS1 GPU Model | Software command interpreter, 1024x512 VRAM, texture sampling, and display registers |
 | Vulkan Renderer | Planned host GPU backend; not integrated. SDL2 presents the software framebuffer today |
 | Audio Runtime | Partial SPU register, ADPCM, and DMA model; no host audio output yet |
-| Input Backend | SDL2 keyboard/gamepad mapped to the SIO pad; mouse support planned |
+| Input Backend | GLFW gamepad backend (`GlfwBackend`), SDL2 keyboard; per-device JSON profiles near-native latency to the SIO pad; mouse support planned |
 | Camera Profiles | Planned game-specific mouse-to-camera mappings |
 
 The Vulkan renderer is not intended to replace the entire console architecture. CPU execution, memory behavior, synchronization, audio, and game-specific logic require separate implementations.
 
 ## Build and Test
 
-Requirements: CMake 3.20 or newer, a C++20 compiler, and Ninja. SDL2 is optional;
-when found, CMake also builds the `psxreborn_play` frontend.
+Requirements: CMake 3.20 or newer, a C++20 compiler, and Ninja. SDL2 and
+GLFW are optional but SDL2+GLFW are required for the `psxreborn_play` frontend
+(SDL2 owns the window/renderer, GLFW owns controller input).
 
 ```sh
 cmake -S . -B build -G Ninja -DPSXREBORN_BUILD_TESTS=ON
@@ -145,7 +146,7 @@ Camera control is game-dependent. Games without native camera control or suitabl
 - [x] MIPS R3000A interpreter with COP0, GTE, interrupts, timers, and DMA.
 - [x] BIOS HLE hooks, CD-ROM image access, and `SYSTEM.CNF` boot parsing.
 - [x] Software GPU command interpreter and VRAM model.
-- [x] SDL2 play frontend with keyboard and gamepad input.
+- [x] SDL2 play frontend with keyboard input; controller input through the GLFW gamepad backend.
 - [ ] Initial native code translation pipeline.
 - [ ] Minimal Vulkan rendering prototype.
 - [ ] Complete PS1 GPU rendering semantics (semi-transparency, dithering, display timing).

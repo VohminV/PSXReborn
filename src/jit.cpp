@@ -18,6 +18,7 @@
 #endif
 
 #include "psxreborn/memory.hpp"
+#include "psxreborn/memory_watch.hpp"
 
 namespace psxreborn {
 
@@ -640,6 +641,9 @@ int jitRead(JitContext* context, uint32_t address, uint32_t size, uint32_t pc,
             context->branchTaken != 0, context->branchTarget);
         return result.reason != CpuStopReason::None ? 2 : 1;
     }
+    if (psxreborn::memoryWatchEnabled()) {
+        psxreborn::memoryWatchLoad(address, &value, pc, context->regs[31]);
+    }
     context->ioValue = value;
     context->ioMask = 0xFFFFFFFFu;
     return 0;
@@ -656,6 +660,9 @@ int jitReadPartial(JitContext* context, uint32_t address, uint32_t pc, uint32_t 
             fault, pc, instruction, aligned, false, (flags & 1u) != 0,
             context->branchTaken != 0, context->branchTarget);
         return result.reason != CpuStopReason::None ? 2 : 1;
+    }
+    if (psxreborn::memoryWatchEnabled()) {
+        psxreborn::memoryWatchLoad(address, &value, pc, context->regs[31]);
     }
     static constexpr uint32_t leftMasks[4] = {0x00FFFFFFu, 0x0000FFFFu, 0x000000FFu, 0u};
     static constexpr uint32_t leftByteMasks[4] = {0x000000FFu, 0x0000FFFFu, 0x00FFFFFFu,
@@ -680,6 +687,7 @@ int jitWrite(JitContext* context, uint32_t address, uint32_t size, uint32_t pc,
     MemoryFault fault = MemoryFault::None;
     bool ok = false;
     const uint32_t value = context->ioValue;
+    psxreborn::memoryWatchStore(address, value, pc);
     if (size == 1) {
         ok = context->memory->write8(address, static_cast<uint8_t>(value), &fault);
     } else if (size == 2) {
@@ -718,6 +726,7 @@ int jitWritePartial(JitContext* context, uint32_t address, uint32_t pc, uint32_t
     } else {
         value = (memory & rightMasks[shift]) | (context->ioValue << rightShifts[shift]);
     }
+    psxreborn::memoryWatchStore(address, value, pc);
     if (!context->memory->write32(aligned, value, &fault)) {
         const CpuStepResult result = context->cpu->jitMemoryFault(
             fault, pc, instruction, aligned, true, (flags & 1u) != 0,

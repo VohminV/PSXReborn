@@ -42,6 +42,7 @@ public:
 
     // State exposed to SIO0 and tracing.
     std::size_t responseIndex() const { return responseIndex_; }
+    std::size_t responseLen() const { return responseLen_; }
     uint8_t lastCommand() const { return lastCommand_; }
     uint32_t ticks() const { return ticks_; }
     bool ackPending() const { return responseIndex_ < responseLen_; }

@@ -13,12 +13,29 @@ namespace psxreborn::inputtrace {
 // All timestamps are steady_clock nanoseconds since epoch (CLOCK_MONOTONIC).
 // The uinput injector in the input harness uses the same clock, so injection
 // timestamps and trace timestamps are directly comparable.
+//
+// PSXREBORN_TRACE_CHAIN=1 (or PSXREBORN_TRACE_INPUT=3) additionally enables
+// the frame-tagged end-to-end chain: host snapshot -> mapping -> PadState ->
+// SIO0 latch -> pad response -> BIOS data. Every layer prints the play loop's
+// host frame number so one physical press can be followed through the whole
+// pipeline.
 
 bool enabled();
 bool verbose();
+bool chainEnabled();
 int64_t nowNs();
 
 void logLine(const char* fmt, ...);
+
+// Frame marker for chained diagnostics. The play loop calls beginFrame once
+// per host iteration; SIO0/BIOS/trace calls made during guest execution reuse
+// that number.
+void beginFrame(uint64_t frame);
+uint64_t frameNumber();
+
+// Frame-tagged diagnostic line for one layer (HOST/MAPPING/PAD/SIO0/BIOS/
+// MENU). No-op unless the chain trace is enabled.
+void chainLine(const char* layer, const char* fmt, ...);
 
 // State was acquired from the host input backend and stored (Play side).
 void notePublish(uint16_t buttons, const char* source);
@@ -34,7 +51,7 @@ void noteTx(uint8_t command, uint16_t buttons, unsigned slot);
 // One pad response byte was emitted (level 2 only).
 void noteTxByte(uint8_t command, unsigned index, uint8_t value);
 
-// Backend polled SDL state without a value change (level 2 only).
+// Backend polled GLFW state without a value change (level 2 only).
 void notePoll(uint16_t buttons);
 
 struct Summary {

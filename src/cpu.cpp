@@ -1,4 +1,5 @@
 #include "psxreborn/cpu.hpp"
+#include "psxreborn/memory_watch.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -6,8 +7,121 @@
 #include "psxreborn/jit.hpp"
 
 #include <limits>
+#include <unordered_map>
 
 namespace psxreborn {
+namespace {
+
+// Live bounded trace window around the failing pad-driver wait (runtime debug only).
+int gWaitWinArmed = 0;
+
+int gCellWrites = 0;
+
+void traceCellWrite(const char* op, uint32_t address, uint32_t value, uint32_t pc) {
+    if (address == 0x1F801070u) {
+        static int iStatPrints = 0;
+        if (iStatPrints < 2000) {
+            ++iStatPrints;
+            std::fprintf(stderr, "[PW] istat-write %s v=%08X pc=0x%08X\n", op, value, pc);
+        }
+        return;
+    }
+    if ((address & ~0xCu) == 0x801CD370u && gCellWrites < 40) {
+        ++gCellWrites;
+        std::fprintf(stderr, "[PW] cell-write %s addr=%08X v=%08X pc=0x%08X\n", op, address, value,
+                     pc);
+    }
+}
+
+void waitWinArm() {
+    if (const char* v = std::getenv("PSXREBORN_WAIT_WIN"); v != nullptr && gWaitWinArmed == 0) {
+        gWaitWinArmed = std::atoi(v);
+        if (gWaitWinArmed <= 0 || gWaitWinArmed > 100000) gWaitWinArmed = 128;
+    }
+}
+
+int gIstatWinArmed = 0;
+
+}  // anonymous namespace
+
+// Load watch shared with the JIT path (see include/psxreborn/memory_watch.hpp).
+bool memoryWatchEnabled() {
+    static bool enabled = (std::getenv("PSXREBORN_WATCH") != nullptr);
+    return enabled;
+}
+
+void memoryWatchLoad(uint32_t address, const uint32_t* value, uint32_t pc, uint32_t ra) {
+    static bool initialized = false;
+    static uint32_t base = 0;
+    static uint32_t len = 0;
+    if (!initialized) {
+        initialized = true;
+        const char* spec = std::getenv("PSXREBORN_WATCH");
+        if (spec == nullptr) {
+            len = 0;
+        } else {
+            uint32_t b = 0;
+            unsigned l = 0;
+            if (std::sscanf(spec, "%x:%x", &b, &l) == 2 && l != 0 && l < 0x100000) {
+                base = b & 0x7FFFFFFFu;
+                len = l;
+                std::fprintf(stderr, "[WATCH] enabled %08X len %X\n", base, len);
+            } else {
+                len = 0;
+            }
+        }
+    }
+    if (len == 0) {
+        return;
+    }
+    static std::unordered_map<uint32_t, uint32_t> last;
+    const uint32_t phys = address & 0x7FFFFFFFu;
+    if (phys < base || phys >= base + len) {
+        return;
+    }
+    const uint32_t newVal = value != nullptr ? *value : 0;
+    const auto it = last.find(phys);
+    if (it == last.end() || it->second != newVal) {
+        if (it == last.end()) {
+            last.emplace(phys, newVal);
+        } else {
+            it->second = newVal;
+        }
+        std::fprintf(stderr, "[WATCH] v=%08X addr=%08X pc=%08X ra=%08X\n", newVal, address, pc,
+                     ra);
+    }
+}
+
+void memoryWatchStore(uint32_t address, uint32_t value, uint32_t pc) {
+    static bool initialized = false;
+    static uint32_t base = 0;
+    static uint32_t len = 0;
+    if (!initialized) {
+        initialized = true;
+        const char* spec = std::getenv("PSXREBORN_WSTORE");
+        if (spec == nullptr) {
+            len = 0;
+        } else {
+            uint32_t b = 0;
+            unsigned l = 0;
+            if (std::sscanf(spec, "%x:%x", &b, &l) == 2 && l != 0 && l < 0x100000) {
+                base = b & 0x7FFFFFFFu;
+                len = l;
+                std::fprintf(stderr, "[WSTORE] enabled %08X len %X\n", base, len);
+            } else {
+                len = 0;
+            }
+        }
+    }
+    if (len == 0) {
+        return;
+    }
+    const uint32_t phys = address & 0x7FFFFFFFu;
+    if (phys < base || phys >= base + len) {
+        return;
+    }
+    std::fprintf(stderr, "[WSTORE] addr=%08X v=%08X pc=%08X ra=%08X\n", address, value, pc, pc);
+}
 
 Cpu::Cpu(Memory& memory) : memory_(memory) {
     reset();
@@ -281,6 +395,20 @@ CpuStepResult Cpu::step() {
 
     const Instruction instruction = decodeInstruction(raw);
     softTrace(pc_);
+    if (gIstatWinArmed > 0 && pc_ >= 0x8004F420u && pc_ <= 0x8004F540u) {
+        uint32_t istat = 0;
+        uint32_t sr = 0;
+        memory_.read32(0x1F801070u, istat, nullptr);
+        memory_.read32(0x1F801044u, sr, nullptr);
+        std::fprintf(stderr, "[IW] pc=%08X raw=%08X istat=%03X sr=%04X v0=%08X a0=%08X\n", pc_, raw,
+                     istat & 0x3FFu, sr & 0xFFFFu, reg(2), reg(4));
+        --gIstatWinArmed;
+    }
+    if (gWaitWinArmed > 0) {
+        std::fprintf(stderr, "[CPUW] pc=0x%08X raw=%08X a4=%08X r9=%08X v0=%08X v1=%08X\n", pc_, raw,
+                     reg(4), reg(9), reg(2), reg(3));
+        --gWaitWinArmed;
+    }
     if (!instruction.valid()) {
         if (executionMode_ == CpuExecutionMode::Hardware) {
             raiseException(CpuException::ReservedInstruction);
@@ -656,6 +784,14 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
             if (!memory_.read8(address, value, &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, false);
             }
+            if (std::getenv("PSXREBORN_TRACE_SIO_COMPILED") != nullptr &&
+                (address & ~0x60000000u) == 0x1F801044u) {
+                std::fprintf(stderr, "[CPU] lb STAT=%02X pc=%08X ra=%08X\n", value, pc, reg(31));
+            }
+            {
+                const uint32_t v32 = value;
+                psxreborn::memoryWatchLoad(address, &v32, pc, reg(31));
+            }
             scheduleLoad(rt, static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(value))));
             return {};
         }
@@ -665,6 +801,14 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
             MemoryFault fault = MemoryFault::None;
             if (!memory_.read8(address, value, &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, false);
+            }
+            if (std::getenv("PSXREBORN_TRACE_SIO_COMPILED") != nullptr &&
+                (address & ~0x60000000u) == 0x1F801044u) {
+                std::fprintf(stderr, "[CPU] lbu STAT=%02X pc=%08X ra=%08X\n", value, pc, reg(31));
+            }
+            {
+                const uint32_t v32 = value;
+                psxreborn::memoryWatchLoad(address, &v32, pc, reg(31));
             }
             scheduleLoad(rt, value);
             return {};
@@ -676,6 +820,11 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
             if (!memory_.read16(address, value, &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, false);
             }
+            if (std::getenv("PSXREBORN_TRACE_SIO_COMPILED") != nullptr &&
+                (address & ~0x60000000u) == 0x1F801044u) {
+                std::fprintf(stderr, "[CPU] lh STAT=%04X pc=%08X ra=%08X\n", value, pc, reg(31));
+            }
+            psxreborn::memoryWatchLoad(address, nullptr, pc, reg(31));
             scheduleLoad(rt, static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(value))));
             return {};
         }
@@ -685,6 +834,10 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
             MemoryFault fault = MemoryFault::None;
             if (!memory_.read16(address, value, &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, false);
+            }
+            {
+                const uint32_t v32 = value;
+                psxreborn::memoryWatchLoad(address, &v32, pc, reg(31));
             }
             scheduleLoad(rt, value);
             return {};
@@ -696,6 +849,12 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
             if (!memory_.read32(address, value, &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, false);
             }
+            if (std::getenv("PSXREBORN_TRACE_SIO_COMPILED") != nullptr &&
+                (address & ~0x60000000u) == 0x1F801044u) {
+                std::fprintf(stderr, "[CPU] lw STAT=%04X pc=%08X ra=%08X\n", value & 0xFFFFu, pc,
+                             reg(31));
+            }
+            psxreborn::memoryWatchLoad(address, &value, pc, reg(31));
             scheduleLoad(rt, value);
             return {};
         }
@@ -712,6 +871,7 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
             static constexpr uint32_t shifts[4] = {24, 16, 8, 0};
             const uint32_t shift = address & 3u;
             value &= byteMasks[shift];
+            psxreborn::memoryWatchLoad(address, &value, pc, reg(31));
             schedulePartialLoad(rt, value << shifts[shift], masks[shift]);
             return {};
         }
@@ -728,6 +888,7 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
             static constexpr uint32_t shifts[4] = {0, 8, 16, 24};
             const uint32_t shift = address & 3u;
             value &= byteMasks[shift];
+            psxreborn::memoryWatchLoad(address, &value, pc, reg(31));
             schedulePartialLoad(rt, value >> shifts[shift], masks[shift]);
             return {};
         }
@@ -735,12 +896,16 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
         case Opcode::Sb: {
             const uint32_t address = rsValue + immediate;
             if (const char* t = std::getenv("PSXREBORN_TRACE_SIO_COMPILED");
-                t != nullptr && address >= 0x1F801040u && address < 0x1F801050u) {
+                t != nullptr &&
+                ((address >= 0x1F801040u && address < 0x1F801050u) ||
+                 (address >= 0x1F801120u && address < 0x1F80112Cu))) {
                 std::fprintf(stderr, "[CPU] sb pc=0x%08X addr=%08X v=%02X ra=0x%08X\n", pc,
                              address, static_cast<unsigned>(rtValue & 0xFFu),
                              reg(31));
             }
             MemoryFault fault = MemoryFault::None;
+            traceCellWrite("sb", address, rtValue & 0xFFu, pc);
+            psxreborn::memoryWatchStore(address, rtValue & 0xFFu, pc);
             if (!memory_.write8(address, static_cast<uint8_t>(rtValue & 0xFFu), &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, true);
             }
@@ -749,7 +914,9 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
         case Opcode::Sh: {
             const uint32_t address = rsValue + immediate;
             if (const char* t = std::getenv("PSXREBORN_TRACE_SIO_COMPILED");
-                t != nullptr && address >= 0x1F801040u && address < 0x1F801050u) {
+                t != nullptr &&
+                ((address >= 0x1F801040u && address < 0x1F801050u) ||
+                 (address >= 0x1F801120u && address < 0x1F80112Cu))) {
                 std::fprintf(stderr, "[CPU] sh pc=0x%08X addr=%08X v=%04X ra=0x%08X\n", pc,
                              address, static_cast<unsigned>(rtValue & 0xFFFFu), reg(31));
                 static bool ramDumped = false;
@@ -767,6 +934,8 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
                 }
             }
             MemoryFault fault = MemoryFault::None;
+            traceCellWrite("sh", address, rtValue & 0xFFFFu, pc);
+            psxreborn::memoryWatchStore(address, rtValue & 0xFFFFu, pc);
             if (!memory_.write16(address, static_cast<uint16_t>(rtValue & 0xFFFFu), &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, true);
             }
@@ -775,11 +944,15 @@ CpuStepResult Cpu::execute(const Instruction& instruction, uint32_t pc, PendingL
         case Opcode::Sw: {
             const uint32_t address = rsValue + immediate;
             if (const char* t = std::getenv("PSXREBORN_TRACE_SIO_COMPILED");
-                t != nullptr && address >= 0x1F801040u && address < 0x1F801050u) {
+                t != nullptr &&
+                ((address >= 0x1F801040u && address < 0x1F801050u) ||
+                 (address >= 0x1F801120u && address < 0x1F80112Cu))) {
                 std::fprintf(stderr, "[CPU] sw pc=0x%08X addr=%08X v=%08X ra=0x%08X\n", pc,
                              address, rtValue, reg(31));
             }
             MemoryFault fault = MemoryFault::None;
+            traceCellWrite("sw", address, rtValue, pc);
+            psxreborn::memoryWatchStore(address, rtValue, pc);
             if (!memory_.write32(address, rtValue, &fault)) {
                 return memoryFault(fault, pc, instruction.raw, address, true);
             }
@@ -983,11 +1156,163 @@ void Cpu::softTrace(uint32_t pc) {
     uint32_t phase = 0;
     uint32_t scratch = 0;
     auto rd32 = [&](uint32_t a, uint32_t& v) { memory_.read32(a, v, nullptr); };
+    auto rd8v = [&](uint32_t a, uint8_t& v) { memory_.read8(a, v, nullptr); };
     switch (pc) {
+        case 0x8004A5E4u: {
+            static uint32_t fwCount = 0;
+            if (++fwCount % 5000u != 1u) break;
+            uint32_t statusPtr = 0;
+            uint32_t qPtr = 0;
+            memory_.read32(0x8006978u, statusPtr, nullptr);
+            memory_.read32(0x8006980u, qPtr, nullptr);
+            uint8_t statusByte = 0;
+            uint32_t qCount = 0;
+            if (statusPtr != 0) memory_.read8(statusPtr, statusByte, nullptr);
+            if (qPtr != 0) memory_.read32(qPtr, qCount, nullptr);
+            uint8_t slotByte = 0;
+            memory_.read8(0x800672F0u, slotByte, nullptr);
+            uint32_t b4C4 = 0;
+            uint32_t b6BC = 0;
+            memory_.read32(0x8006B4C4u, b4C4, nullptr);
+            memory_.read32(0x80066BCu, b6BC, nullptr);
+            uint8_t b6C0 = 0;
+            memory_.read8(0x80066C0u, b6C0, nullptr);
+            fprintf(stderr,
+                    "[PW] frame-worker slot=%u status=%02X q=%04X b4C4=%04X b6BC=%04X b6C0=%04X\n",
+                    slotByte, statusByte, qCount & 0xFFFFu, b4C4 & 0xFFFFu, b6BC & 0xFFFFu,
+                    b6C0);
+            break;
+        }
+        case 0x8004A3F8u: {
+            uint32_t semAddr = 0;
+            uint32_t semType = 0;
+            memory_.read32(0x8006B0ACu, semAddr, nullptr);
+            memory_.read32(0x8006B0A4u, semType, nullptr);
+            fprintf(stderr, "[PW] [SEMFERM] a0=%08X a1=%08X sem=%08X type=%08X\n", reg(4), reg(5),
+                    semAddr, semType);
+            break;
+        }
+        case 0x8004E970u:
+        case 0x8004E9B8u: {
+            static unsigned copyIdx = 0;
+            ++copyIdx;
+            if (copyIdx % 40u == 1u) {
+                char path[80];
+                std::snprintf(path, sizeof(path), "/tmp/opencode/padgame%03u.bin", (copyIdx / 40u));
+                FILE* dump = std::fopen(path, "wb");
+                if (dump != nullptr) {
+                    for (uint32_t base = 0x801BD2A0u; base < 0x801BD400u; base += 4) {
+                        uint32_t word = 0;
+                        memory_.read32(base, word, nullptr);
+                        std::fwrite(&word, 1, 4, dump);
+                    }
+                    std::fclose(dump);
+                }
+            }
+            uint32_t dst = reg(4);
+            uint32_t src = reg(5);
+            fprintf(stderr, "[PW] padcopy pc=%08X dst=%08X src=%08X:", pc + 8u, dst, src);
+            if (src != 0) {
+                for (uint32_t i = 0; i < 8; ++i) {
+                    uint8_t byte = 0;
+                    memory_.read8(src + i, byte, nullptr);
+                    fprintf(stderr, " %02X", byte);
+                }
+            }
+            fprintf(stderr, "\n");
+            break;
+        }
+        case 0x80051364u: {
+            static uint64_t seq51364 = 0;
+            ++seq51364;
+            uint32_t dst1 = 0;
+            uint32_t s0v = reg(16);
+            memory_.read32(s0v + 0x30u, dst1, nullptr);
+            if (seq51364 % 8u == 1u) {
+                fprintf(stderr, "[PW4] copydone s0=%08X dst=%08X:", s0v, dst1);
+                for (uint32_t i = 0; i < 8; ++i) {
+                    uint8_t byte = 0;
+                    memory_.read8(dst1 + i, byte, nullptr);
+                    fprintf(stderr, " %02X", byte);
+                }
+                fprintf(stderr, " n308=");
+                for (uint32_t i = 0; i < 8; ++i) {
+                    uint8_t byte = 0;
+                    memory_.read8(0x801BD308u + i, byte, nullptr);
+                    fprintf(stderr, " %02X", byte);
+                }
+                fprintf(stderr, "\n");
+            }
+            break;
+        }
+        case 0x80051340u: {
+            static uint32_t s51340 = 0;
+            static uint64_t seq51340 = 0;
+            ++seq51340;
+            s51340 = reg(16);
+            uint32_t dstPtr = 0;
+            if (s51340 != 0) memory_.read32(s51340 + 0x30u, dstPtr, nullptr);
+            if (seq51340 % 64u == 1u) {
+                uint8_t b35 = 0;
+                uint8_t b46 = 0;
+                rd8v(s51340 + 0x35u, b35);
+                rd8v(s51340 + 0x46u, b46);
+                fprintf(stderr, "[PW3] bytecopy s0=%08X dst=%08X count35=%02X cnt46=%02X\n",
+                        s51340, dstPtr, b35, b46);
+            }
+            break;
+        }
         case 0x8004F048u:
             rd32(0x80067490u, phase);
             fprintf(stderr, "[PW] dispatch-in phase=%u seq=%llu\n", phase,
                     (unsigned long long)(seq++));
+            if (phase == 4) {
+                static uint64_t dbIdx = 0;
+                ++dbIdx;
+                uint32_t bufPtr = 0;
+                memory_.read32(0x801BD3C0u, bufPtr, nullptr);
+                fprintf(stderr, "[PW2] poll-done#%llu bufptr=%08X buf=",
+                        (unsigned long long)dbIdx, bufPtr);
+                for (uint32_t i = 0; i < 8; ++i) {
+                    uint8_t byte = 0;
+                    memory_.read8(bufPtr + i, byte, nullptr);
+                    fprintf(stderr, " %02X", byte);
+                }
+                fprintf(stderr, " node308=");
+                for (uint32_t i = 0; i < 8; ++i) {
+                    uint8_t byte = 0;
+                    memory_.read8(0x801BD308u + i, byte, nullptr);
+                    fprintf(stderr, " %02X", byte);
+                }
+                fprintf(stderr, " s0c4=");
+                for (uint32_t i = 0x44; i < 0x4C; ++i) {
+                    uint8_t byte = 0;
+                    memory_.read8(0x801BD384u + i, byte, nullptr);
+                    fprintf(stderr, " %02X", byte);
+                }
+                fprintf(stderr, "\n");
+            }
+            if (const char* env = std::getenv("PSXREBORN_STRUCT_DUMP");
+                env != nullptr && phase == 0) {
+                static unsigned dumpIdx = 0;
+                static uint64_t dumpEvery = 0;
+                static uint64_t dumpCount = 0;
+                if (dumpEvery == 0) dumpEvery = std::strtoull(env, nullptr, 0);
+                ++dumpCount;
+                if (dumpCount % dumpEvery == 0) {
+                    char path[80];
+                    std::snprintf(path, sizeof(path), "/tmp/opencode/struct%04u.bin", dumpIdx++);
+                    FILE* dump = std::fopen(path, "wb");
+                    if (dump != nullptr) {
+                        for (uint32_t base = 0x801BD380u; base < 0x801BD5C0u; base += 4) {
+                            uint32_t word = 0;
+                            memory_.read32(base, word, nullptr);
+                            std::fwrite(&word, 1, 4, dump);
+                        }
+                        std::fclose(dump);
+                    }
+                }
+            }
             break;
         case 0x8004F088u:
             rd32(0x80067490u, phase);
@@ -1043,13 +1368,61 @@ void Cpu::softTrace(uint32_t pc) {
         case 0x8004F430u:
             fprintf(stderr, "[PW] send-irq-check-passed (I_STAT bit7 set)\n");
             break;
-        case 0x8004F438u:
-            fprintf(stderr, "[PW] send-acklevel-wait-enter stat=%04X\n",
-                    ([] { uint32_t v = 0; return v; }()));
+        case 0x8004F438u: {
+            waitWinArm();
+            if (const char* v = std::getenv("PSXREBORN_ISTAT_WIN");
+                v != nullptr && gIstatWinArmed == 0) {
+                gIstatWinArmed = std::atoi(v);
+                if (gIstatWinArmed <= 0 || gIstatWinArmed > 100000) gIstatWinArmed = 2000;
+            }
+            uint32_t stat = 0;
+            uint32_t istat = 0;
+            uint32_t imask = 0;
+            memory_.read32(0x1F801044u, stat, nullptr);
+            memory_.read32(0x1F801070u, istat, nullptr);
+            memory_.read32(0x1F801074u, imask, nullptr);
+            fprintf(stderr, "[PW] send-acklevel-wait-enter stat=%04X istat=%03X imask=%03X t0=%08X\n",
+                    stat & 0xFFFFu, istat & 0x7FFu, imask & 0x7FFu, reg(8));
+            static int hits = 0;
+            ++hits;
+            static bool ramDumpedWait = false;
+            if (hits == 3 && !ramDumpedWait) {
+                ramDumpedWait = true;
+                FILE* dump = std::fopen("/tmp/opencode/live_wait.bin", "wb");
+                if (dump != nullptr) {
+                    for (uint32_t base = 0x8004E000u; base < 0x8004FFFFu; base += 4) {
+                        uint32_t word = 0;
+                        memory_.read32(base, word, nullptr);
+                        std::fwrite(&word, 1, 4, dump);
+                    }
+                    std::fclose(dump);
+                    fprintf(stderr, "[PW] dumped live RAM 0x8004E000-0x8004FFFF (hit3)\n");
+                }
+                // Dump the send-context struct (padman "s0" register) so the
+                // tx state machine layout can be decoded offline.
+                const uint32_t s0 = reg(19);
+                fprintf(stderr, "[PW] wait3 s0=%08X a0=%08X a1=%08X s1=%08X\n",
+                        s0, reg(4), reg(5), reg(17));
+                if (s0 != 0) {
+                    FILE* s0dump = std::fopen("/tmp/opencode/live_s0.bin", "wb");
+                    if (s0dump != nullptr) {
+                        const uint32_t base = s0 & ~3u;
+                        for (uint32_t a = 0; a < 0x50; a += 1) {
+                            uint8_t byte = 0;
+                            memory_.read8(base + a, byte, nullptr);
+                            std::fwrite(&byte, 1, 1, s0dump);
+                        }
+                        for (uint32_t a = 0; a < 0x200; a += 4) {
+                            uint32_t word = 0;
+                            memory_.read32(base + a, word, nullptr);
+                            std::fwrite(&word, 1, 4, s0dump);
+                        }
+                        std::fclose(s0dump);
+                    }
+                }
+            }
             break;
-        case 0x8004F4C4u:
-            fprintf(stderr, "[PW] send-ack-timeout path (ret fffe) ra=%08X\n", reg(31));
-            break;
+        }
         case 0x8004F5B0u: {
             uint32_t count = 0;
             uint32_t word = 0;
@@ -1067,6 +1440,46 @@ void Cpu::softTrace(uint32_t pc) {
             break;
         case 0x80050304u:
             fprintf(stderr, "[PW] phase3-id-rx v1=%08X\n", reg(3));
+            break;
+        case 0x8004F4F0u: {
+            // Reached after the wait loop succeeded; inspect the fast-path
+            // gate [s0+0xE8] and the phase field to trace which branch the
+            // per-byte ACK-wait takes.
+            uint32_t s0 = reg(19);
+            uint32_t stage = 0;
+            uint32_t phase = 0;
+            if (s0 != 0) memory_.read32((s0 & ~3u) + 0xE8, stage, nullptr);
+            memory_.read32(0x80067490u, phase, nullptr);
+            uint32_t tmr2Count = 0;
+            uint32_t tmr2Mode = 0;
+            memory_.read32(0x1F801120u, tmr2Count, nullptr);
+            memory_.read32(0x1F801124u, tmr2Mode, nullptr);
+            fprintf(stderr,
+                    "[PW] send-fast-path stage=%02X phase=%u tmr2=%04X mode=%04X\n",
+                    stage & 0xFFu, phase, tmr2Count & 0xFFFFu, tmr2Mode & 0x3FFu);
+            break;
+        }
+        case 0x8004F4DCu: {
+            // Inside the deadline wait loop: report the current TMR2 state so
+            // the padman budget can be validated against our timer model.
+            uint32_t tmr2Count = 0;
+            uint32_t tmr2Mode = 0;
+            uint32_t istat = 0;
+            memory_.read32(0x1F801120u, tmr2Count, nullptr);
+            memory_.read32(0x1F801124u, tmr2Mode, nullptr);
+            memory_.read32(0x1F801070u, istat, nullptr);
+            static int loopPrints = 0;
+            if (loopPrints < 16) {
+                ++loopPrints;
+                fprintf(stderr,
+                        "[PW] send-wait-loop count=%04X mode=%04X istat=%03X a0=%08X a1=%08X\n",
+                        tmr2Count & 0xFFFFu, tmr2Mode & 0x3FFu, istat & 0x7FFu, reg(4), reg(5));
+            }
+            break;
+        }
+        case 0x8004F4C0u:
+            fprintf(stderr, "[PW] send-wait-deadline-hit v0=-2 a0=%08X a1=%08X\n", reg(4),
+                    reg(5));
             break;
         case 0x8004F160u:
             fprintf(stderr, "[PW] startTx-len-set\n");

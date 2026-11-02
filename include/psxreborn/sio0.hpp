@@ -88,15 +88,19 @@ private:
 
     static constexpr std::size_t kRxFifoSize = 8;
 
-    uint8_t transfer(uint8_t value);
+    void resetUnit();
+    void transfer(uint8_t value);
+    uint8_t executeTransfer(uint8_t value);
     uint8_t transferCard(uint8_t value);
     void selectDevice(uint8_t addressByte);
     void deselect();
     void writeControl(uint16_t value);
     void requestIrq();
+    void armAck();
     bool rxThresholdReached() const;
     void pushRx(uint8_t value);
     uint8_t popRx();
+    uint8_t rxFifoPreview(std::size_t index) const;
     void clearRx();
     MemoryCard* card() const;
 
@@ -121,7 +125,22 @@ private:
     std::size_t rxCount_ = 0;
     bool irq_ = false;
     bool ackAsserted_ = false;
-    uint32_t ackClearDelay_ = 0;
+    // Pending /ACK pulse timeline, in CPU cycles (see docs/serialinterfacessio.md):
+    // the pulse is scheduled after a byte, asserts kAckAssertCycles later
+    // (outside the kernel's ignore window), stays low ~100 cycles, and the
+    // interrupt fires while /ACK is still low.
+    bool ackScheduled_ = false;
+    uint32_t ackAssertDelay_ = 0;
+    uint32_t ackLowRemaining_ = 0;
+    // Debug-only running CPU cycle counter accumulated by tick(); used for
+    // byte-interval traces (PSXREBORN_TRACE_SIO) when reverse engineering
+    // the kernel pad driver's per-byte deadlines.
+    uint64_t clk_ = 0;
+    // DR writes latch TXEN at write time; a byte written while TXEN is
+    // disabled stays pending and transfers as soon as TXEN is set again.
+    uint8_t pendingTx_ = 0xFFu;
+    bool hasPendingTx_ = false;
+    bool txenLatched_ = false;
     uint16_t mode_ = 0;
     uint16_t control_ = 0;
     uint16_t baud_ = 0;

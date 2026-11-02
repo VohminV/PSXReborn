@@ -218,7 +218,7 @@ DLSS сейчас не реализован: в репозитории нет NV
 - [x] `PadState` (`pad.hpp/cpp`): активные-high кнопки, стики 0–255, комбинирование keyboard/controller/stick.
 - [x] `xinputToPadButtons()` и `PadState::setXInputButtons()`: единый маппинг XInput → PS1.
 - [x] `PadSource`: интерфейс отбора снапшота в момент pad select.
-- [x] `XInputBackend` (`tools/xinput_backend.*`): SDL GameController, hot-plug, throttle 250 us, подавление при открытом меню.
+- [x] `GlfwBackend` (`tools/glfw_backend.*`, замена `XInputBackend`): GLFW gamepad API (`glfwGetGamepadState`) + raw-ветка джойстиков, hot-plug через GLFW callback, throttle 250 us, подавление при открытом меню. Идентичности устройств — `glfw:<имя>: GLFW 3.3 не даёт стабильного GUID, профили по устройствам с одинаковым именем общие.
 - [x] `Ps1PadDevice` / `DualShockDevice` (`ps1_pad_device.*`): команды `0x42/43/44/45/46/47/4C/4D`, ID `0x41/0x73/0xF3`, snapshot на начало транзакции.
 - [x] `Sio0` остаётся аппаратным интерфейсом (JOY_DATA/STAT/MODE/CTRL/BAUD, FIFO, SELECT, ACK, IRQ); не знает про SDL/XInput.
 - [x] `System::refreshPadFromSource()` для BIOS HLE pad-сервисов.
@@ -247,7 +247,8 @@ DLSS сейчас не реализован: в репозитории нет NV
 ### 4.5.4. Инструментирование
 
 - [x] `PSXREBORN_TRACE_INPUT=1|2`: publish/push/tx/tx_byte/poll, 1 Hz summary с fps/tps/avg_us/max_us.
-- [x] `XInputBackend::pollCount()/refreshCount()`.
+- [x] `PSXREBORN_TRACE_CHAIN=1` / `PSXREBORN_TRACE_INPUT=3`: HOST → MAPPING → PAD → SIO0 → BIOS/MENU с общим frame id.
+- [x] `GlfwBackend::pollCount()/refreshCount()`.
 - [ ] Отдельный harness для injection-timestamp → guest-visible latency.
 
 ## Этап 5. Интеграция с оригинальными играми

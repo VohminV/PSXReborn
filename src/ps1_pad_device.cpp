@@ -69,6 +69,8 @@ void Ps1PadDevice::prepareDigitalRead() {
     response_[3] = static_cast<uint8_t>((input_.buttons >> 8u) & 0xFFu);
     responseLen_ = 4;
     responseIndex_ = 1;
+    inputtrace::chainLine("SIO0", "response cmd=42 id=41 pad=%04X bytes=41 5A %02X %02X",
+                          input_.buttons, response_[2], response_[3]);
 }
 
 void DualShockDevice::prepareResponse(uint8_t command) {
@@ -86,6 +88,11 @@ void DualShockDevice::prepareResponse(uint8_t command) {
                 response_[7] = input_.leftY;
                 responseLen_ = 8;
                 responseIndex_ = 1;
+                inputtrace::chainLine(
+                    "SIO0",
+                    "response cmd=42 id=%02X pad=%04X bytes=%02X 5A %02X %02X %02X %02X %02X %02X",
+                    response_[0], buttons, response_[0], response_[2], response_[3],
+                    response_[4], response_[5], response_[6], response_[7]);
             } else {
                 prepareDigitalRead();
             }

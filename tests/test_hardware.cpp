@@ -60,6 +60,36 @@ TEST_CASE(interrupts_mask_status_and_acknowledge) {
     CHECK_EQ(static_cast<unsigned>(fault), static_cast<unsigned>(MemoryFault::Unsupported));
 }
 
+TEST_CASE(interrupts_acknowledge_and_semantics_for_masked_writes) {
+    // psx-spx "Interrupts": write I_STAT: 0=Clear Bit, 1=No change. The
+    // register is ANDed with the written value, so guest code writing masks
+    // with high bits set (e.g. 0xFFFFFF7F) must still clear only the low bit
+    // that is written as 0, leaving every 1 bit unchanged.
+    Memory memory;
+    System system(memory);
+    system.reset();
+
+    system.interrupts().request(Interrupts::kPad | Interrupts::kVBlank |
+                                Interrupts::kDma | Interrupts::kCdrom);
+    CHECK(memory.write32(Interrupts::kStatAddress, 0xFFFFFF7Fu));
+    uint32_t value = 0;
+    CHECK(memory.read32(Interrupts::kStatAddress, value));
+    CHECK_EQ(value, Interrupts::kVBlank | Interrupts::kDma | Interrupts::kCdrom);
+
+    CHECK(memory.write16(Interrupts::kStatAddress, 0xFFF7u));
+    CHECK(memory.read32(Interrupts::kStatAddress, value));
+    CHECK_EQ(value, Interrupts::kVBlank | Interrupts::kCdrom);
+
+    // A 1 bit leaves the flag unchanged even when no new IRQ was raised.
+    CHECK(memory.write32(Interrupts::kStatAddress, 0xFFFFFFFFu));
+    CHECK(memory.read32(Interrupts::kStatAddress, value));
+    CHECK_EQ(value, Interrupts::kVBlank | Interrupts::kCdrom);
+
+    CHECK(memory.write32(Interrupts::kStatAddress, 0));
+    CHECK(memory.read32(Interrupts::kStatAddress, value));
+    CHECK_EQ(value, 0u);
+}
+
 TEST_CASE(timers_compare_target_and_interrupt) {
     Memory memory;
     System system(memory);

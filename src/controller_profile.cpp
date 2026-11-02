@@ -1,5 +1,7 @@
 #include "psxreborn/controller_profile.hpp"
 
+#include "psxreborn/input_trace.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -50,16 +52,14 @@ const std::array<const char*, kPs1ButtonCount> kPs1Tokens{{
     "l2", "r2", "l3", "r3",
 }};
 
-// Editor cycle order: face buttons, shoulders then sticks, dpad, triggers,
-// system buttons, extras. Values mirror the host button ids above.
+// Editor cycle order: face buttons, bumpers then thumb buttons, dpad, system
+// buttons. Values mirror the GLFW gamepad button ids above.
 const std::vector<HostControl> kHostButtonChoices{{
     kHostBtnA, kHostBtnB, kHostBtnX, kHostBtnY,
-    kHostBtnLeftShoulder, kHostBtnRightShoulder,
-    kHostBtnLeftStick, kHostBtnRightStick,
+    kHostBtnLeftBumper, kHostBtnRightBumper,
+    kHostBtnLeftThumb, kHostBtnRightThumb,
     kHostBtnDpadUp, kHostBtnDpadDown, kHostBtnDpadLeft, kHostBtnDpadRight,
-    kHostBtnStart, kHostBtnBack,
-    kHostBtnMisc1, kHostBtnPaddle1, kHostBtnPaddle2, kHostBtnPaddle3,
-    kHostBtnPaddle4, kHostBtnTouchpad,
+    kHostBtnStart, kHostBtnBack, kHostBtnGuide,
 }};
 
 const std::vector<HostControl> kHostAxes{{
@@ -73,34 +73,43 @@ struct ControlName {
     const char* lower;
 };
 
-const std::array<ControlName, kHostBtnTouchpad + 1 + kHostAxisCount> kControlNames{{
+// Canonical GLFW gamepad names; serialize() writes the lowercase form.
+const std::array<ControlName, kHostBtnCount + kHostAxisCount> kControlNames{{
     {kHostBtnA, "A", "a"},
     {kHostBtnB, "B", "b"},
     {kHostBtnX, "X", "x"},
     {kHostBtnY, "Y", "y"},
+    {kHostBtnLeftBumper, "LB", "lb"},
+    {kHostBtnRightBumper, "RB", "rb"},
     {kHostBtnBack, "BACK", "back"},
-    {kHostBtnGuide, "GUIDE", "guide"},
     {kHostBtnStart, "START", "start"},
-    {kHostBtnLeftStick, "LSTICK", "lstick"},
-    {kHostBtnRightStick, "RSTICK", "rstick"},
-    {kHostBtnLeftShoulder, "LB", "left_shoulder"},
-    {kHostBtnRightShoulder, "RB", "right_shoulder"},
+    {kHostBtnGuide, "GUIDE", "guide"},
     {kHostBtnDpadUp, "DPAD UP", "dpad_up"},
     {kHostBtnDpadDown, "DPAD DOWN", "dpad_down"},
     {kHostBtnDpadLeft, "DPAD LEFT", "dpad_left"},
     {kHostBtnDpadRight, "DPAD RIGHT", "dpad_right"},
-    {kHostBtnMisc1, "MISC1", "misc1"},
-    {kHostBtnPaddle1, "PADDLE1", "paddle1"},
-    {kHostBtnPaddle2, "PADDLE2", "paddle2"},
-    {kHostBtnPaddle3, "PADDLE3", "paddle3"},
-    {kHostBtnPaddle4, "PADDLE4", "paddle4"},
-    {kHostBtnTouchpad, "TOUCHPAD", "touchpad"},
+    {kHostBtnLeftThumb, "LTHUMB", "lthumb"},
+    {kHostBtnRightThumb, "RTHUMB", "rthumb"},
     {kHostAxisLeftX, "AXIS LEFT X", "axis_left_x"},
     {kHostAxisLeftY, "AXIS LEFT Y", "axis_left_y"},
     {kHostAxisRightX, "AXIS RIGHT X", "axis_right_x"},
     {kHostAxisRightY, "AXIS RIGHT Y", "axis_right_y"},
     {kHostAxisTriggerLeft, "AXIS TRIGGER LEFT", "axis_trigger_left"},
     {kHostAxisTriggerRight, "AXIS TRIGGER RIGHT", "axis_trigger_right"},
+}};
+
+// Parsed-only aliases: pre-GLFW SDL-era tokens plus GLFW enums not covered by
+// the canonical names. Kept out of hostControlName so profiles re-save in the
+// GLFW vocabulary.
+const std::array<ControlName, 8> kControlAliases{{
+    {kHostBtnLeftBumper, "LEFT BUMPER", "left_bumper"},
+    {kHostBtnRightBumper, "RIGHT BUMPER", "right_bumper"},
+    {kHostBtnLeftBumper, "LEFT SHOULDER", "left_shoulder"},
+    {kHostBtnRightBumper, "RIGHT SHOULDER", "right_shoulder"},
+    {kHostBtnLeftThumb, "LEFT THUMB", "left_thumb"},
+    {kHostBtnRightThumb, "RIGHT THUMB", "right_thumb"},
+    {kHostBtnLeftThumb, "LEFT STICK", "left_stick"},
+    {kHostBtnRightThumb, "RIGHT STICK", "right_stick"},
 }};
 
 // Minimal JSON scanner for the flat profile document: strings with escapes,
@@ -268,19 +277,16 @@ HostControl controlFromString(const std::string& raw, bool& ok) {
         ok = true;
         return kHostNone;
     }
+    for (const ControlName& entry : kControlAliases) {
+        if (name == entry.lower) {
+            ok = true;
+            return entry.control;
+        }
+    }
     for (const ControlName& entry : kControlNames) {
-        std::string candidate;
-        for (const char* source : {entry.lower, entry.upper}) {
-            candidate.clear();
-            for (const char* p = source; *p != '\0'; ++p) {
-                const char lower = static_cast<char>(
-                    std::tolower(static_cast<unsigned char>(*p)));
-                candidate.push_back(lower == ' ' ? '_' : lower);
-            }
-            if (candidate == name) {
-                ok = true;
-                return entry.control;
-            }
+        if (name == entry.lower) {
+            ok = true;
+            return entry.control;
         }
     }
     ok = false;
@@ -345,12 +351,12 @@ ControllerMapping ControllerMapping::defaults() {
     mapping.host[static_cast<std::size_t>(Ps1Name::Right)] = kHostBtnDpadRight;
     mapping.host[static_cast<std::size_t>(Ps1Name::Start)] = kHostBtnStart;
     mapping.host[static_cast<std::size_t>(Ps1Name::Select)] = kHostBtnBack;
-    mapping.host[static_cast<std::size_t>(Ps1Name::L1)] = kHostBtnLeftShoulder;
-    mapping.host[static_cast<std::size_t>(Ps1Name::R1)] = kHostBtnRightShoulder;
+    mapping.host[static_cast<std::size_t>(Ps1Name::L1)] = kHostBtnLeftBumper;
+    mapping.host[static_cast<std::size_t>(Ps1Name::R1)] = kHostBtnRightBumper;
     mapping.host[static_cast<std::size_t>(Ps1Name::L2)] = kHostAxisTriggerLeft;
     mapping.host[static_cast<std::size_t>(Ps1Name::R2)] = kHostAxisTriggerRight;
-    mapping.host[static_cast<std::size_t>(Ps1Name::L3)] = kHostBtnLeftStick;
-    mapping.host[static_cast<std::size_t>(Ps1Name::R3)] = kHostBtnRightStick;
+    mapping.host[static_cast<std::size_t>(Ps1Name::L3)] = kHostBtnLeftThumb;
+    mapping.host[static_cast<std::size_t>(Ps1Name::R3)] = kHostBtnRightThumb;
     mapping.deadzone = kDefaultDeadzone;
     mapping.triggerThreshold = kDefaultTriggerThreshold;
     return mapping;
@@ -412,6 +418,7 @@ bool hostControlPressed(const ControllerSnapshot& snapshot,
 
 void applyControllerSnapshot(PadState& pad, const ControllerSnapshot& snapshot,
                              const ControllerMapping& mapping) {
+    const uint16_t previous = pad.pressed();
     pad.clearController();
     for (std::size_t slot = 0; slot < kPs1ButtonCount; ++slot) {
         if (hostControlPressed(snapshot, mapping, mapping.host[slot])) {
@@ -420,6 +427,17 @@ void applyControllerSnapshot(PadState& pad, const ControllerSnapshot& snapshot,
     }
     pad.setLeftStick(snapshot.axes[0], snapshot.axes[1], mapping.deadzone);
     pad.setRightStick(snapshot.axes[2], snapshot.axes[3]);
+    if (inputtrace::chainEnabled() && pad.pressed() != previous) {
+        for (std::size_t slot = 0; slot < kPs1ButtonCount; ++slot) {
+            if (hostControlPressed(snapshot, mapping, mapping.host[slot])) {
+                inputtrace::chainLine("MAPPING", "%s <- %s", ps1ButtonName(slot),
+                                      hostControlName(mapping.host[slot]));
+            }
+        }
+        inputtrace::chainLine("PAD", "active_high=%04X pad_word=%04X sticks=%u,%u,%u,%u",
+                              pad.pressed(), pad.buttons(), pad.leftStickX(),
+                              pad.leftStickY(), pad.rightStickX(), pad.rightStickY());
+    }
 }
 
 void ControllerProfile::applyMissingFields() {
@@ -623,6 +641,19 @@ bool ControllerProfile::parse(const std::string& json, std::string& error) {
 }
 
 std::string ControllerProfile::profilesDirectory() {
+#if defined(_WIN32)
+    const char* appData = std::getenv("APPDATA");
+    std::filesystem::path base;
+    if (appData != nullptr && *appData != '\0') {
+        base = std::filesystem::path(appData);
+    } else if (const char* home = std::getenv("USERPROFILE");
+               home != nullptr && *home != '\0') {
+        base = std::filesystem::path(home) / "AppData" / "Roaming";
+    } else {
+        base = std::filesystem::current_path();
+    }
+    return (base / "PSXReborn" / "profiles").string();
+#else
     const char* xdg = std::getenv("XDG_CONFIG_HOME");
     std::filesystem::path base;
     if (xdg != nullptr && *xdg != '\0') {
@@ -634,6 +665,7 @@ std::string ControllerProfile::profilesDirectory() {
         base = std::filesystem::current_path();
     }
     return (base / "psxreborn" / "profiles").string();
+#endif
 }
 
 std::string ControllerProfile::sanitizeGuid(const std::string& guid) {

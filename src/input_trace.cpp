@@ -15,6 +15,17 @@ bool envVerbose() {
     return value != nullptr && value[0] == '2';
 }
 
+bool envChain() {
+    const char* value = std::getenv("PSXREBORN_TRACE_INPUT");
+    if (value != nullptr && value[0] == '3') {
+        return true;
+    }
+    const char* chain = std::getenv("PSXREBORN_TRACE_CHAIN");
+    return chain != nullptr && chain[0] != '0';
+}
+
+uint64_t g_frame = 0;
+
 uint64_t g_publishes = 0;
 uint64_t g_pushes = 0;
 uint64_t g_transactions = 0;
@@ -41,6 +52,19 @@ bool verbose() {
     return value;
 }
 
+bool chainEnabled() {
+    static const bool value = envChain();
+    return value;
+}
+
+void beginFrame(uint64_t frame) {
+    g_frame = frame;
+}
+
+uint64_t frameNumber() {
+    return g_frame;
+}
+
 int64_t nowNs() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -51,7 +75,23 @@ void logLine(const char* fmt, ...) {
     if (!enabled()) {
         return;
     }
-    std::fprintf(stderr, "[INPUT] t_ns=%lld ", static_cast<long long>(nowNs()));
+    std::fprintf(stderr, "[INPUT] frame=%llu t_ns=%lld ",
+                 static_cast<unsigned long long>(g_frame),
+                 static_cast<long long>(nowNs()));
+    std::va_list args;
+    va_start(args, fmt);
+    std::vfprintf(stderr, fmt, args);
+    va_end(args);
+    std::fputc('\n', stderr);
+}
+
+void chainLine(const char* layer, const char* fmt, ...) {
+    if (!chainEnabled()) {
+        return;
+    }
+    std::fprintf(stderr, "[CHAIN] frame=%llu t_ns=%lld layer=%s ",
+                 static_cast<unsigned long long>(g_frame),
+                 static_cast<long long>(nowNs()), layer);
     std::va_list args;
     va_start(args, fmt);
     std::vfprintf(stderr, fmt, args);

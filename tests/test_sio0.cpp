@@ -1,6 +1,7 @@
 #include <array>
 #include <cstdint>
 
+#include "psxreborn/controller_profile.hpp"
 #include "psxreborn/cpu.hpp"
 #include "psxreborn/hardware.hpp"
 #include "psxreborn/memory.hpp"
@@ -186,6 +187,135 @@ TEST_CASE(sio0_xinput_mask_reaches_guest_pad_protocol) {
     }
 }
 
+TEST_CASE(sio0_automap_reproduces_manual_mapping_mask_bytes) {
+    // The auto-mapped pipeline (GLFW logical button -> XInput mask ->
+    // xinputToPadButtons -> active-low word) must produce the exact same
+    // dual button-mask bytes the manual event mapping produced. Drives both
+    // entry points through a real SIO0/DualShock 0x42 transaction and asserts
+    // identical, active-low bytes for every user-visible button.
+    struct Vector {
+        uint16_t xinput;
+        uint16_t pad;
+        uint8_t low;
+        uint8_t high;
+    };
+    const Vector vectors[] = {
+        {kXInputStart, kPadStart, 0xF7u, 0xFFu},
+        {kXInputBack, kPadSelect, 0xFEu, 0xFFu},
+        {kXInputA, kPadCross, 0xFFu, 0xBFu},
+        {kXInputB, kPadCircle, 0xFFu, 0xDFu},
+        {kXInputX, kPadSquare, 0xFFu, 0x7Fu},
+        {kXInputY, kPadTriangle, 0xFFu, 0xEFu},
+        {kXInputDpadUp, kPadUp, 0xEFu, 0xFFu},
+        {kXInputDpadDown, kPadDown, 0xBFu, 0xFFu},
+        {kXInputDpadLeft, kPadLeft, 0x7Fu, 0xFFu},
+        {kXInputDpadRight, kPadRight, 0xDFu, 0xFFu},
+        {kXInputLeftShoulder, kPadL1, 0xFFu, 0xFBu},
+        {kXInputRightShoulder, kPadR1, 0xFFu, 0xF7u},
+        {kXInputLeftThumb, kPadL3, 0xFDu, 0xFFu},
+        {kXInputRightThumb, kPadR3, 0xFBu, 0xFFu},
+    };
+
+    for (const Vector& vector : vectors) {
+        Memory memory;
+        System system(memory);
+        system.reset();
+        setControl(system, kTxEnable | kSelect);
+        system.sio0().setPadAnalogMode(false);
+
+        // Manual mapping entry point (per-button incremental set).
+        PadState manual;
+        manual.setControllerButton(vector.pad, true);
+        system.setPadButtons(manual.buttons());
+        CHECK_EQ(transfer(system, 0x01), static_cast<uint8_t>(0xFF));
+        CHECK_EQ(transfer(system, 0x42), static_cast<uint8_t>(0x41));
+        CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x5A));
+        CHECK_EQ(transfer(system, 0x00), vector.low);
+        CHECK_EQ(transfer(system, 0x00), vector.high);
+
+        // Auto mapping entry point (polled full-replace set): a new
+        // transaction must sample the same button state and therefore return
+        // the same bytes.
+        setControl(system, kTxEnable);
+        setControl(system, kTxEnable | kSelect);
+        PadState automap;
+        automap.setXInputButtons(vector.xinput);
+        system.setPadButtons(automap.buttons());
+        CHECK_EQ(transfer(system, 0x01), static_cast<uint8_t>(0xFF));
+        CHECK_EQ(transfer(system, 0x42), static_cast<uint8_t>(0x41));
+        CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x5A));
+        CHECK_EQ(transfer(system, 0x00), vector.low);
+        CHECK_EQ(transfer(system, 0x00), vector.high);
+    }
+}
+
+TEST_CASE(sio0_default_profile_maps_all_glfw_buttons_to_guest_bytes) {
+    // Full Home-era chain: GLFW gamepad button id -> ControllerMapping ->
+    // PadState -> SIO0 0x42 response. Every PS1 slot must reach the active-low
+    // mask bytes, so a shifted GLFW id cannot silently turn D-pad DOWN into L3.
+    const ControllerMapping mapping = ControllerMapping::defaults();
+    for (std::size_t slot = 0; slot < kPs1ButtonCount; ++slot) {
+        const HostControl control = mapping.host[slot];
+        ControllerSnapshot snapshot;
+        if (control == kHostAxisTriggerLeft) {
+            snapshot.axes[4] = mapping.triggerThreshold;
+        } else if (control == kHostAxisTriggerRight) {
+            snapshot.axes[5] = mapping.triggerThreshold;
+        } else {
+            snapshot.setButtonPressed(control, true);
+        }
+
+        PadState pad;
+        applyControllerSnapshot(pad, snapshot, mapping);
+        CHECK_EQ(pad.pressed(), ps1ButtonBit(slot));
+
+        Memory memory;
+        System system(memory);
+        system.reset();
+        setControl(system, kTxEnable | kSelect);
+        system.sio0().setPadAnalogMode(false);
+        system.setPadButtons(pad.buttons());
+
+        const uint16_t word = pad.buttons();
+        CHECK_EQ(transfer(system, 0x01), static_cast<uint8_t>(0xFF));
+        CHECK_EQ(transfer(system, 0x42), static_cast<uint8_t>(0x41));
+        CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x5A));
+        CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(word & 0xFFu));
+        CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>((word >> 8u) & 0xFFu));
+    }
+}
+
+TEST_CASE(sio0_automap_input_state_updates_across_transactions) {
+    // The polled auto-mapped state must be re-sampled at each pad select:
+    // press then release of the same button must be guest-visible in the two
+    // mask bytes of consecutive transactions.
+    Memory memory;
+    System system(memory);
+    system.reset();
+    setControl(system, kTxEnable | kSelect);
+    system.sio0().setPadAnalogMode(false);
+
+    PadState pad;
+
+    auto drive = [&](uint16_t xinputMask, uint8_t low, uint8_t high) {
+        setControl(system, kTxEnable);
+        setControl(system, kTxEnable | kSelect);
+        pad.setXInputButtons(xinputMask);
+        system.setPadButtons(pad.buttons());
+        CHECK_EQ(transfer(system, 0x01), static_cast<uint8_t>(0xFF));
+        CHECK_EQ(transfer(system, 0x42), static_cast<uint8_t>(0x41));
+        CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x5A));
+        CHECK_EQ(transfer(system, 0x00), low);
+        CHECK_EQ(transfer(system, 0x00), high);
+    };
+
+    drive(kXInputStart, 0xF7u, 0xFFu);
+    drive(0, 0xFFu, 0xFFu);
+    drive(kXInputA, 0xFFu, 0xBFu);
+    drive(0, 0xFFu, 0xFFu);
+    drive(static_cast<uint16_t>(kXInputBack | kXInputDpadDown), 0xBEu, 0xFFu);
+}
+
 TEST_CASE(sio0_restarts_poll_on_select_toggle) {
     Memory memory;
     System system(memory);
@@ -224,16 +354,22 @@ TEST_CASE(sio0_status_tracks_rx_and_ack) {
     CHECK(system.write8(0x1F801040u, 0x01, &fault));
     CHECK(fault == MemoryFault::None);
     CHECK((status(system) & 0x0002u) != 0);
+    // /ACK asserts only after the whole byte transfer (default baud * 8
+    // cycles), never with the write.
+    CHECK_EQ(status(system) & 0x0080u, 0u);
+    system.sio0().tick(1100u);
     CHECK((status(system) & 0x0080u) != 0);
     uint8_t response = 0;
     CHECK(system.read8(0x1F801040u, response, &fault));
     CHECK_EQ(response, static_cast<uint8_t>(0xFF));
     CHECK_EQ(status(system) & 0x0002u, 0u);
     CHECK_EQ(transfer(system, 0x42), static_cast<uint8_t>(0x41));
+    system.sio0().tick(1100u);
     CHECK((status(system) & 0x0080u) != 0);
     CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x5A));
     CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0xFF));
     CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0xFF));
+    system.sio0().tick(1600u);
     CHECK_EQ(status(system) & 0x0080u, 0u);
 }
 
@@ -254,6 +390,9 @@ TEST_CASE(sio0_rx_fifo_queues_unread_responses) {
 }
 
 TEST_CASE(sio0_wide_data_reads_consume_fifo_entries) {
+    // DR reads: the low byte removes 1 RX FIFO entry; the upper bytes are
+    // non-destructive previews of the next entries
+    // (docs/serialinterfacessio.md).
     Memory memory;
     System system(memory);
     system.reset();
@@ -270,7 +409,9 @@ TEST_CASE(sio0_wide_data_reads_consume_fifo_entries) {
     CHECK(system.read16(0x1F801040u, halfword, &fault));
     CHECK(fault == MemoryFault::None);
     CHECK_EQ(halfword, static_cast<uint16_t>(0x41FFu));
-    CHECK_EQ(readData(system), static_cast<uint8_t>(0x5A));
+    // Only the low byte was consumed.
+    CHECK_EQ(readData(system), static_cast<uint8_t>(0x41u));
+    CHECK_EQ(readData(system), static_cast<uint8_t>(0x5Au));
 
     writeData(system, 0x00);
     writeData(system, 0x00);
@@ -281,6 +422,10 @@ TEST_CASE(sio0_wide_data_reads_consume_fifo_entries) {
     CHECK(system.read32(0x1F801040u, word, &fault));
     CHECK(fault == MemoryFault::None);
     CHECK_EQ(word, 0xFFFFBFFFu);
+    // The previewed entries stay in the FIFO.
+    CHECK_EQ(readData(system), static_cast<uint8_t>(0xBFu));
+    CHECK_EQ(readData(system), static_cast<uint8_t>(0xFFu));
+    CHECK_EQ(readData(system), static_cast<uint8_t>(0xFFu));
 }
 
 TEST_CASE(sio0_rx_irq_honours_fifo_threshold) {
@@ -309,7 +454,10 @@ TEST_CASE(sio0_rx_irq_honours_fifo_threshold) {
     CHECK_EQ(status(system) & 0x0002u, 0u);
 }
 
-TEST_CASE(sio0_empty_rx_returns_last_received_byte) {
+TEST_CASE(sio0_empty_rx_returns_idle_byte) {
+    // Reading DR with an empty RX FIFO returns the idle bus level (0xFF),
+    // never a stale previously received byte (pcsx-redux sio.cc read8;
+    // docs/serialinterfacessio.md DR notes).
     Memory memory;
     System system(memory);
     system.reset();
@@ -322,7 +470,9 @@ TEST_CASE(sio0_empty_rx_returns_last_received_byte) {
     CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x5A));
     CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0xFF));
     CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0xBF));
-    CHECK_EQ(readData(system), static_cast<uint8_t>(0xBF));
+    // The transfer helper consumes every response; the FIFO is empty now and
+    // further reads return the idle bus level.
+    CHECK_EQ(readData(system), static_cast<uint8_t>(0xFF));
 }
 
 TEST_CASE(sio0_deselect_ends_poll_session) {
@@ -451,15 +601,27 @@ TEST_CASE(sio0_ack_irq_and_control_acknowledge) {
 
     CHECK_EQ(transfer(system, 0x01), static_cast<uint8_t>(0xFF));
     CHECK(!system.sio0().irqRequested());
-    system.sio0().tick(129);
+    system.sio0().tick(1087);
     CHECK(!system.sio0().irqRequested());
     system.sio0().tick(1);
     CHECK(system.sio0().irqRequested());
+    // The /ACK interrupt must fire while /ACK is still asserted: drivers poll
+    // JOY_STAT.7 (ACK input level) after the interrupt and expect the level
+    // low, then wait for the pulse to release.
+    CHECK((system.sio0().status() & 0x0080u) != 0);
     CHECK((system.sio0().status() & 0x0200u) != 0);
     CHECK((system.interrupts().status() & Interrupts::kPad) != 0);
 
-    setControl(system, 0);
-    setControl(system, kAcknowledge);
+    // CR.4 cannot clear SR.9 while /ACK is still low (circa 100 cycles).
+    setControl(system, kTxEnable | kSelect | kAckIrqEnable | kAcknowledge);
+    CHECK(system.sio0().irqRequested());
+    CHECK((system.sio0().status() & 0x0200u) != 0);
+
+    // Later ticks release /ACK, and only then the acknowledge clears SR.9.
+    system.sio0().tick(600);
+    CHECK((system.sio0().status() & 0x0080u) == 0);
+    CHECK(system.sio0().irqRequested());
+    setControl(system, kTxEnable | kSelect | kAckIrqEnable | kAcknowledge);
     CHECK_EQ(system.sio0().status() & 0x0200u, 0u);
     CHECK(!system.sio0().irqRequested());
 }
@@ -471,7 +633,7 @@ TEST_CASE(sio0_ack_irq_requires_enable) {
     setControl(system, kTxEnable | kSelect);
 
     CHECK_EQ(transfer(system, 0x01), static_cast<uint8_t>(0xFF));
-    system.sio0().tick(1000);
+    system.sio0().tick(2000);
     CHECK(!system.sio0().irqRequested());
     CHECK_EQ(system.sio0().status() & 0x0200u, 0u);
     CHECK_EQ(system.interrupts().status() & Interrupts::kPad, 0u);
@@ -523,6 +685,69 @@ TEST_CASE(sio0_control_reset_clears_state) {
     CHECK_EQ(system.sio0().selectedSlot(), 0u);
     CHECK(!system.sio0().ackAsserted());
     CHECK_EQ(transfer(system, 0x42), static_cast<uint8_t>(0xFF));
+}
+
+TEST_CASE(sio0_control_reset_preserves_pad_config_mode) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+    setControl(system, kTxEnable | kSelect);
+    system.sio0().setPadAnalogMode(false);
+    system.setPadButtons(static_cast<uint16_t>(0xFFFFu & ~kPadCross));
+
+    // Enter controller config mode: 01 43 00 01 00.
+    CHECK_EQ(transfer(system, 0x01), static_cast<uint8_t>(0xFF));
+    CHECK_EQ(transfer(system, 0x43), static_cast<uint8_t>(0x41));
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x5A));
+    CHECK_EQ(transfer(system, 0x01), static_cast<uint8_t>(0xFF));
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0xBF));
+    CHECK(system.sio0().padConfigMode());
+
+    // CR.6 resets only the SIO unit. The external controller stays in config
+    // mode, so the following 0x45 (Get LED State) must still answer.
+    setControl(system, 1u << 6);
+    setControl(system, kTxEnable | kSelect);
+
+    CHECK_EQ(transfer(system, 0x01), static_cast<uint8_t>(0xFF));
+    CHECK_EQ(transfer(system, 0x45), static_cast<uint8_t>(0xF3));
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x5A));
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x01));
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x02));
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x00));
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x02));
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x01));
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x00));
+    CHECK(system.sio0().padConfigMode());
+}
+
+TEST_CASE(sio0_full_pad_poll_preserves_ack_level_and_buttons) {
+    Memory memory;
+    System system(memory);
+    system.reset();
+    system.setPadButtons(static_cast<uint16_t>(0xFFFFu & ~kPadCross));
+    setControl(system, kTxEnable | kSelect | kAckIrqEnable);
+
+    CHECK_EQ(transfer(system, 0x01), static_cast<uint8_t>(0xFF));
+    // /ACK asserts only after the byte transfer completes (baud * 8 cycles).
+    CHECK(!system.sio0().ackAsserted());
+    system.sio0().tick(1100);
+    CHECK(system.sio0().ackAsserted());
+    system.sio0().tick(500);
+    CHECK(!system.sio0().ackAsserted());
+    CHECK_EQ(transfer(system, 0x42), static_cast<uint8_t>(0x41));
+    system.sio0().tick(1300);
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(0x5A));
+    system.sio0().tick(1300);
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>(~kPadCross & 0xFFu));
+    system.sio0().tick(1300);
+    CHECK_EQ(transfer(system, 0x00), static_cast<uint8_t>((~kPadCross >> 8) & 0xFFu));
+
+    // The final data byte carries no /ACK: after acknowledging the pending
+    // interrupt from the last ACKed byte, no further interrupt arrives.
+    setControl(system, kAcknowledge);
+    system.sio0().tick(2000);
+    CHECK(!system.sio0().ackAsserted());
+    CHECK(!system.sio0().irqRequested());
 }
 
 TEST_CASE(sio0_memory_card_read_and_write_protocol) {

@@ -11,6 +11,7 @@
 #include "psxreborn/cdrom.hpp"
 #include "psxreborn/cpu.hpp"
 #include "psxreborn/hardware.hpp"
+#include "psxreborn/input_trace.hpp"
 
 namespace psxreborn {
 
@@ -110,6 +111,11 @@ void Bios::padUpdate() {
         memory_.write8(padBuf1_ + 5, system_.padRightY());
         memory_.write8(padBuf1_ + 6, system_.padLeftX());
         memory_.write8(padBuf1_ + 7, system_.padLeftY());
+        inputtrace::chainLine("BIOS", "pad buf=%08X bytes=00 73 %02X %02X %02X %02X %02X %02X",
+                              padBuf1_, static_cast<uint8_t>(buttons & 0xFFu),
+                              static_cast<uint8_t>((buttons >> 8) & 0xFFu),
+                              system_.padRightX(), system_.padRightY(),
+                              system_.padLeftX(), system_.padLeftY());
     }
     if (padBuf2_ != 0) {
         memory_.write8(padBuf2_ + 0, 0);
